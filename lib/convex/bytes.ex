@@ -1,4 +1,10 @@
 defmodule Convex.Bytes do
+  @moduledoc """
+  Wraps a binary as a Convex Bytes value on the wire.
+
+      Convex.mutation(client, "files:upload", %{"data" => Convex.Bytes.new(<<1, 2, 3>>)})
+  """
+
   @enforce_keys [:data]
   defstruct [:data]
 

@@ -32,7 +32,7 @@ defmodule Convex.Sync.QueryToken do
   defp normalize_value(value) when is_map(value) do
     value
     |> Enum.map(fn {key, nested} -> {key, normalize_value(nested)} end)
-    |> Enum.sort_by(fn {key, _} -> key end)
+    |> Enum.sort_by(fn {key, _value} -> key end)
   end
 
   # Token canonicalization must treat native `1` and `1.0` as the same
@@ -43,7 +43,7 @@ defmodule Convex.Sync.QueryToken do
   defp normalize_object(map) do
     map
     |> Enum.map(fn {key, value} -> {key, normalize_value(value)} end)
-    |> Enum.sort_by(fn {key, _} -> key end)
+    |> Enum.sort_by(fn {key, _value} -> key end)
   end
 
   defp serialize(value) when is_list(value) do
@@ -68,7 +68,7 @@ defmodule Convex.Sync.QueryToken do
   defp keywordish?(value) do
     Enum.all?(value, fn
       {key, _nested} when is_binary(key) -> true
-      _ -> false
+      _other -> false
     end)
   end
 end

@@ -65,6 +65,47 @@ defmodule Convex.ClientTest do
     end
   end
 
+  defmodule CrashableTransport do
+    @behaviour Convex.Transport
+
+    use GenServer
+
+    defstruct [:owner]
+
+    @impl true
+    def start_link(opts) do
+      GenServer.start_link(__MODULE__, opts)
+    end
+
+    @impl true
+    def send_text(_pid, _text), do: :ok
+
+    @impl true
+    def close(pid) do
+      GenServer.cast(pid, :close)
+    end
+
+    def crash(pid, reason \\ :boom) do
+      GenServer.cast(pid, {:crash, reason})
+    end
+
+    @impl true
+    def init(opts) do
+      owner = Keyword.fetch!(opts, :owner)
+      send(owner, {:convex_transport, self(), :connected})
+      {:ok, %__MODULE__{owner: owner}}
+    end
+
+    @impl true
+    def handle_cast(:close, state) do
+      {:stop, :normal, state}
+    end
+
+    def handle_cast({:crash, reason}, state) do
+      {:stop, reason, state}
+    end
+  end
+
   test "cold query subscribes, waits for transition, and unsubscribes" do
     {:ok, client} =
       Client.start_link(
@@ -217,6 +258,55 @@ defmodule Convex.ClientTest do
     ControlledTransport.close(transport)
 
     refute_receive {:convex_connection_state, ^ref, _}, 100
+  end
+
+  test "transport crash does not kill client and triggers reconnect" do
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210/",
+        transport_module: CrashableTransport,
+        inactivity_check_ms: 100_000,
+        backoff: [rng: fn -> 0.0 end]
+      )
+
+    assert Process.alive?(client)
+    assert :sys.get_state(client).ws_url == "ws://localhost:3210/api/sync"
+
+    transport = wait_for_transport(client)
+    assert Client.connection_state(client) == :connected
+
+    CrashableTransport.crash(transport, :boom)
+
+    new_transport = wait_until_value(fn -> current_transport_pid(client, transport) end)
+
+    assert Process.alive?(client)
+    assert is_pid(new_transport)
+    assert new_transport != transport
+    assert :sys.get_state(client).last_close_reason == "TransportExit: :boom"
+  end
+
+  test "startVersion mismatch triggers reconnect" do
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        backoff: [rng: fn -> 0.0 end]
+      )
+
+    transport = wait_for_transport(client)
+
+    Mock.inject_server_message(transport, %{
+      "type" => "Transition",
+      "startVersion" => %{"querySet" => 9, "identity" => 0, "ts" => "AAAAAAAAAAA="},
+      "endVersion" => %{"querySet" => 10, "identity" => 0, "ts" => "AQAAAAAAAAA="},
+      "modifications" => []
+    })
+
+    new_transport = wait_until_value(fn -> current_transport_pid(client, transport) end)
+
+    assert new_transport != transport
+    assert :sys.get_state(client).last_close_reason == "StartVersionMismatch"
   end
 
   test "auth_fetcher is applied on the initial connection" do

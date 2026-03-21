@@ -32,6 +32,7 @@ defmodule Convex.Sync.Core do
   @type changed_queries :: %{query_id() => function_result()}
 
   defmodule LocalQuery do
+    @moduledoc false
     @enforce_keys [:id, :udf_path, :args]
     defstruct [
       :id,
@@ -126,7 +127,7 @@ defmodule Convex.Sync.Core do
   end
 
   @spec unsubscribe(t(), subscriber_id()) :: {:ok, t()} | {:error, :unknown_subscriber}
-  def unsubscribe(%__MODULE__{} = state, subscriber_id = {query_id, _index}) do
+  def unsubscribe(%__MODULE__{} = state, {query_id, _index} = subscriber_id) do
     if MapSet.member?(state.subscribers, subscriber_id) do
       token = state.query_id_to_token[query_id]
       query = state.query_set[token]
@@ -289,11 +290,11 @@ defmodule Convex.Sync.Core do
                state.request_manager,
                message.end_version.ts
              ) do
-        active_query_ids = Map.keys(state.query_id_to_token) |> MapSet.new()
-
         latest_results =
           remote_query_set
-          |> Enum.filter(fn {query_id, _result} -> MapSet.member?(active_query_ids, query_id) end)
+          |> Enum.filter(fn {query_id, _result} ->
+            Map.has_key?(state.query_id_to_token, query_id)
+          end)
           |> Map.new()
 
         changed_queries = diff_results(state.latest_results, latest_results)

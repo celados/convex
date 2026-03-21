@@ -75,7 +75,7 @@ defmodule Convex.Transport.WebSocket do
   end
 
   def handle_cast(:close, state) do
-    _ = send_frame(state, :close)
+    _result = send_frame(state, :close)
     Mint.HTTP.close(state.conn)
     {:stop, :normal, state}
   end
@@ -195,21 +195,22 @@ defmodule Convex.Transport.WebSocket do
   # ── Internal ──
 
   defp send_frame(state, frame) do
-    with {:ok, websocket, data} <- Mint.WebSocket.encode(state.websocket, frame),
-         state = %{state | websocket: websocket},
-         {:ok, conn} <- Mint.WebSocket.stream_request_body(state.conn, state.request_ref, data) do
-      {:ok, %{state | conn: conn}}
-    else
-      {:error, %Mint.WebSocket{} = websocket, reason} ->
-        {:error, %{state | websocket: websocket}, reason}
+    case Mint.WebSocket.encode(state.websocket, frame) do
+      {:ok, websocket, data} ->
+        state = %{state | websocket: websocket}
 
-      {:error, conn, reason} ->
-        {:error, %{state | conn: conn}, reason}
+        case Mint.WebSocket.stream_request_body(state.conn, state.request_ref, data) do
+          {:ok, conn} -> {:ok, %{state | conn: conn}}
+          {:error, conn, reason} -> {:error, %{state | conn: conn}, reason}
+        end
+
+      {:error, websocket, reason} ->
+        {:error, %{state | websocket: websocket}, reason}
     end
   end
 
   defp do_close(state) do
-    _ = send_frame(state, :close)
+    _result = send_frame(state, :close)
     Mint.HTTP.close(state.conn)
     send(state.owner, {:convex_transport, self(), {:closed, :normal}})
     {:stop, :normal, state}

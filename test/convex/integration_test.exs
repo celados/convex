@@ -55,7 +55,8 @@ defmodule Convex.IntegrationTest do
       assert Enum.any?(todos, fn t -> t["text"] == "elixir_integration_test" end)
 
       # Clean up
-      assert {:ok, _} = Convex.mutation(client, "todos:remove", %{"id" => id}, timeout: @timeout)
+      assert {:ok, _result} =
+               Convex.mutation(client, "todos:remove", %{"id" => id}, timeout: @timeout)
 
       # Verify removal
       assert {:ok, todos} = Convex.query(client, "todos:list", %{}, timeout: @timeout)
@@ -82,7 +83,7 @@ defmodule Convex.IntegrationTest do
 
       # Clean up
       Convex.unsubscribe(client, subscription)
-      {:ok, _} = Convex.mutation(client, "todos:remove", %{"id" => id}, timeout: @timeout)
+      {:ok, _result} = Convex.mutation(client, "todos:remove", %{"id" => id}, timeout: @timeout)
     end
   end
 

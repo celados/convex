@@ -16,20 +16,30 @@ Each item should answer:
 - What should trigger revisiting it
 - What the next concrete step is
 
+## Hex Publish Readiness
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `package` metadata in mix.exs | Done | description, licenses, links, files |
+| LICENSE file | Done | MIT |
+| `@moduledoc` on public types (Int64, Bytes, ConvexError) | Done | |
+| `@moduledoc false` on internal modules | Done | Protocol.Optional was missing it |
+| Trailing-slash defense in `sync_url/1` | Done | Codex fix |
+| Confirm GitHub repo URL in mix.exs | Blocked | Repo not yet created; update `@source_url` when available |
+| Update README installation to hex dep | Blocked | Can't do until first `mix hex.publish` succeeds |
+| Hex.pm account + API key | Blocked | Requires manual `mix hex.user register` or `mix hex.user auth` |
+| `ex_doc` dependency for hexdocs | Not started | Add `{:ex_doc, "~> 0.35", only: :dev, runtime: false}` when ready |
+| Transport crash isolation (monitor vs link) | Not started | Low risk; transport always stops with `:normal` today, but a Mint crash would cascade. See audit notes below |
+
 ## Open Items
 
-### [ ] Audit the current Mint transport against the spec before release
+### [x] Audit Mint transport against spec — completed 2026-03-21
 
-- Current choice: [mix.exs](./mix.exs) uses `mint_web_socket`, and [lib/convex/transport/websocket.ex](./lib/convex/transport/websocket.ex) is implemented directly on Mint.
-- Why acceptable at the time: the transport migration is already done, and the current implementation is good enough to support reconnect/auth replay/state notification work while the rest of the client stabilizes.
-- Remaining risk: the old TODO outlived the migration, which hid the real follow-up work. What remains now is not "replace websockex", but auditing the Mint transport for any remaining spec drift or lifecycle gaps before release.
-- Revisit when: before public release, during dependency upgrades, or the next time transport lifecycle/backpressure/close-handling code is touched.
-- Next step: review the current Mint transport behavior against `convex_spec.md`, then add or tighten tests around handshake, close semantics, and reconnect edge cases where needed.
+No spec-compliance issues found. Three minor improvements identified and applied (trailing slash, moduledocs, package metadata). One architecture note deferred:
 
-### [ ] Design a public optimistic update API instead of shipping hidden local overlay behavior
+- **Transport process link vs monitor**: The client `start_link`s the transport, so a non-normal transport crash kills the client. Current code always stops with `:normal`, making this theoretical. Fix when robustness matters (e.g., production use under adversarial network conditions).
 
-- Current choice: only connection state notifications are exposed publicly; `Convex.Sync.Core.optimistic_results` remains an internal placeholder and `mutation/4` keeps server-authoritative semantics.
-- Why acceptable at the time: the local spec and `convex-rs` reference both stop short of defining a stable user-facing optimistic update contract, so shipping an API now would be guesswork.
-- Remaining risk: the spec still mentions optimistic query results internally, so future contributors could assume user-visible optimistic updates already exist when they do not.
-- Revisit when: we agree on the public API shape for optimistic writes, rollback rules, reconnect behavior, and how local overlays compose with `watch_all`.
-- Next step: write a concrete spec for optimistic updates first, then implement it as an explicit public API change instead of implicit `mutation/4` behavior.
+### [x] Optimistic updates — won't implement
+
+- Decision: backend clients should not expose optimistic updates.
+- Rationale: optimistic updates trade correctness for perceived latency. Frontend UIs can tolerate a rollback; backend logic acting on unconfirmed state risks irreversible side effects. The `optimistic_results` field in Core remains an unused placeholder — it may be removed in a future cleanup.

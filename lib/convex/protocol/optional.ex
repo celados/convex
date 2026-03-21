@@ -1,4 +1,5 @@
 defmodule Convex.Protocol.Optional do
+  @moduledoc false
   @type t(value) :: :absent | {:present, value}
 
   @spec absent() :: :absent

@@ -187,7 +187,7 @@ defmodule Convex.Protocol.Codec do
     {:error, "Unsupported server message type #{inspect(unknown)}"}
   end
 
-  def decode_server_message(_), do: {:error, "Unsupported server message payload"}
+  def decode_server_message(_payload), do: {:error, "Unsupported server message payload"}
 
   defp encode_modifications(modifications) do
     Enum.reduce_while(modifications, {:ok, []}, fn modification, {:ok, acc} ->
@@ -239,7 +239,8 @@ defmodule Convex.Protocol.Codec do
     end
   end
 
-  defp decode_transition_modifications(_), do: {:error, "Transition modifications must be a list"}
+  defp decode_transition_modifications(_modifications),
+    do: {:error, "Transition modifications must be a list"}
 
   defp decode_transition_modification(%{"type" => "QueryUpdated"} = payload) do
     with {:ok, value} <- Value.decode(payload["value"]) do
@@ -276,7 +277,8 @@ defmodule Convex.Protocol.Codec do
     {:ok, %QueryRemoved{query_id: query_id}}
   end
 
-  defp decode_transition_modification(_), do: {:error, "Unsupported Transition modification"}
+  defp decode_transition_modification(_modification),
+    do: {:error, "Unsupported Transition modification"}
 
   defp decode_state_version(%{"querySet" => query_set, "identity" => identity, "ts" => ts}) do
     with {:ok, decoded_ts} <- Value.decode_u64(ts) do
@@ -284,7 +286,7 @@ defmodule Convex.Protocol.Codec do
     end
   end
 
-  defp decode_state_version(_), do: {:error, "Invalid state version"}
+  defp decode_state_version(_version), do: {:error, "Invalid state version"}
 
   defp decode_response_result(true, result, _payload), do: Value.decode(result)
   defp decode_response_result(false, result, _payload) when is_binary(result), do: {:ok, result}

@@ -12,18 +12,28 @@ defmodule Convex.Client do
   alias Convex.Value
 
   defmodule Subscription do
+    @moduledoc false
     @enforce_keys [:ref, :subscriber_id]
     defstruct [:ref, :subscriber_id]
+
+    @type t :: %__MODULE__{
+            ref: reference(),
+            subscriber_id: {non_neg_integer(), non_neg_integer()}
+          }
   end
 
   defmodule Watch do
+    @moduledoc false
     @enforce_keys [:ref]
     defstruct [:ref]
+    @type t :: %__MODULE__{ref: reference()}
   end
 
   defmodule ConnectionWatch do
+    @moduledoc false
     @enforce_keys [:ref]
     defstruct [:ref]
+    @type t :: %__MODULE__{ref: reference()}
   end
 
   defstruct [
@@ -131,6 +141,8 @@ defmodule Convex.Client do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     deployment_url = Keyword.fetch!(opts, :deployment_url)
     transport_module = Keyword.get(opts, :transport_module, WebSocket)
     transport_opts = Keyword.get(opts, :transport_opts, [])
@@ -268,61 +280,11 @@ defmodule Convex.Client do
   end
 
   def handle_call({:mutation, udf_path, args}, from, state) do
-    with :ok <- validate_args(args) do
-      {core, request_id} = Core.prepare_mutation(state.core, udf_path, args)
-      {core, messages} = Core.take_outbox(core)
-
-      state = %{
-        state
-        | core: core,
-          request_waiters: Map.put(state.request_waiters, request_id, from)
-      }
-
-      case dispatch_messages(state, messages) do
-        {:ok, state} ->
-          {:noreply, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason},
-           %{
-             state
-             | core: state.core,
-               request_waiters: Map.delete(state.request_waiters, request_id)
-           }}
-      end
-    else
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
+    dispatch_oneshot_request(&Core.prepare_mutation/3, udf_path, args, from, state)
   end
 
   def handle_call({:action, udf_path, args}, from, state) do
-    with :ok <- validate_args(args) do
-      {core, request_id} = Core.prepare_action(state.core, udf_path, args)
-      {core, messages} = Core.take_outbox(core)
-
-      state = %{
-        state
-        | core: core,
-          request_waiters: Map.put(state.request_waiters, request_id, from)
-      }
-
-      case dispatch_messages(state, messages) do
-        {:ok, state} ->
-          {:noreply, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason},
-           %{
-             state
-             | core: state.core,
-               request_waiters: Map.delete(state.request_waiters, request_id)
-           }}
-      end
-    else
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
+    dispatch_oneshot_request(&Core.prepare_action/3, udf_path, args, from, state)
   end
 
   def handle_call({:query, udf_path, args}, from, state) do
@@ -333,21 +295,7 @@ defmodule Convex.Client do
 
       case dispatch_messages(state, messages) do
         {:ok, state} ->
-          case initial do
-            nil ->
-              {:noreply,
-               %{state | pending_queries: Map.put(state.pending_queries, subscriber_id, from)}}
-
-            result ->
-              {:ok, core} = Core.unsubscribe(core, subscriber_id)
-              {core, unsubscribe_messages} = Core.take_outbox(core)
-              GenServer.reply(from, result)
-
-              case dispatch_messages(%{state | core: core}, unsubscribe_messages) do
-                {:ok, state} -> {:noreply, state}
-                {:error, _reason} -> {:noreply, %{state | core: core}}
-              end
-          end
+          handle_query_result(state, core, subscriber_id, initial, from)
 
         {:error, reason} ->
           {:reply, {:error, reason}, state}
@@ -436,7 +384,6 @@ defmodule Convex.Client do
         state = %{
           state
           | core: core,
-            backoff: Backoff.reset(state.backoff),
             connection_count: state.connection_count + 1
         }
 
@@ -492,16 +439,72 @@ defmodule Convex.Client do
      )}
   end
 
+  def handle_info({:EXIT, transport_pid, reason}, %{transport_pid: transport_pid} = state) do
+    {:noreply,
+     schedule_reconnect(
+       %{state | transport_pid: nil},
+       "TransportExit: #{inspect(reason)}"
+     )}
+  end
+
+  def handle_info({:EXIT, _pid, :normal}, state) do
+    {:noreply, state}
+  end
+
   def handle_info(message, state) do
     Logger.debug("Ignoring unexpected Convex.Client message: #{inspect(message)}")
     {:noreply, state}
+  end
+
+  defp dispatch_oneshot_request(prepare_fn, udf_path, args, from, state) do
+    with :ok <- validate_args(args) do
+      {core, request_id} = prepare_fn.(state.core, udf_path, args)
+      {core, messages} = Core.take_outbox(core)
+
+      state = %{
+        state
+        | core: core,
+          request_waiters: Map.put(state.request_waiters, request_id, from)
+      }
+
+      case dispatch_messages(state, messages) do
+        {:ok, state} ->
+          {:noreply, state}
+
+        {:error, reason} ->
+          {:reply, {:error, reason},
+           %{
+             state
+             | core: state.core,
+               request_waiters: Map.delete(state.request_waiters, request_id)
+           }}
+      end
+    else
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp handle_query_result(state, _core, subscriber_id, nil, from) do
+    {:noreply, %{state | pending_queries: Map.put(state.pending_queries, subscriber_id, from)}}
+  end
+
+  defp handle_query_result(state, core, subscriber_id, result, from) do
+    {:ok, core} = Core.unsubscribe(core, subscriber_id)
+    {core, unsubscribe_messages} = Core.take_outbox(core)
+    GenServer.reply(from, result)
+
+    case dispatch_messages(%{state | core: core}, unsubscribe_messages) do
+      {:ok, state} -> {:noreply, state}
+      {:error, _reason} -> {:noreply, %{state | core: core}}
+    end
   end
 
   defp dispatch_messages(state, messages) do
     with {:ok, payloads} <- encode_messages(messages) do
       Enum.each(payloads, fn payload ->
         if state.transport_pid do
-          _ = state.transport_module.send_text(state.transport_pid, payload)
+          _result = state.transport_module.send_text(state.transport_pid, payload)
         end
       end)
 
@@ -552,7 +555,7 @@ defmodule Convex.Client do
           send(owner, {:convex, ref, result})
           nested
 
-        _, nested ->
+        _other_subscription, nested ->
           nested
       end)
     end)
@@ -586,7 +589,7 @@ defmodule Convex.Client do
 
   defp reconnect(state, reason) do
     if state.transport_pid do
-      _ = state.transport_module.close(state.transport_pid)
+      _result = state.transport_module.close(state.transport_pid)
     end
 
     schedule_reconnect(%{state | transport_pid: nil}, reason)
@@ -615,9 +618,9 @@ defmodule Convex.Client do
     %{state | inactivity_timer: timer}
   end
 
-  defp sync_url("https://" <> rest), do: "wss://" <> rest <> "/api/sync"
-  defp sync_url("http://" <> rest), do: "ws://" <> rest <> "/api/sync"
-  defp sync_url(url), do: url <> "/api/sync"
+  defp sync_url("https://" <> rest), do: "wss://" <> trim_trailing_slash(rest) <> "/api/sync"
+  defp sync_url("http://" <> rest), do: "ws://" <> trim_trailing_slash(rest) <> "/api/sync"
+  defp sync_url(url), do: trim_trailing_slash(url) <> "/api/sync"
 
   defp validate_args(args) when is_map(args) do
     case Value.encode(args) do
@@ -644,8 +647,9 @@ defmodule Convex.Client do
             {%{state | auth_token: token}, auth_input_from_token(token)}
 
           :no_auth ->
-            # fetcher returning nil semantically means "this connection should be anonymous"; we must not reuse the old token，
-            # otherwise logout/refresh failure will cause us to silently reconnect with expired credentials.
+            # fetcher returning nil semantically means "this connection should be anonymous";
+            # we must not reuse the old token, otherwise logout/refresh failure will cause
+            # us to silently reconnect with expired credentials.
             {%{state | auth_token: nil}, :no_auth}
         end
     end
@@ -680,6 +684,10 @@ defmodule Convex.Client do
       {:ok, state} -> state
       {:error, _reason} -> state
     end
+  end
+
+  defp trim_trailing_slash(url) do
+    String.trim_trailing(url, "/")
   end
 
   defp uuid4 do

@@ -9,8 +9,16 @@ defmodule Convex.Sync.RequestManager do
           | {:completed_immediate, function_result()}
 
   defmodule Request do
+    @moduledoc false
     @enforce_keys [:id, :type, :status, :message]
     defstruct [:id, :type, :status, :message]
+
+    @type t :: %__MODULE__{
+            id: non_neg_integer(),
+            type: Convex.Sync.RequestManager.request_type(),
+            status: Convex.Sync.RequestManager.request_status(),
+            message: struct()
+          }
   end
 
   defstruct ongoing_requests: %{}
@@ -39,13 +47,13 @@ defmodule Convex.Sync.RequestManager do
          true <- request.type == request_type do
       {status, completed_now} =
         case {request_type, value} do
-          {:action, _} ->
+          {:action, _value} ->
             {{:completed_immediate, value}, %{request_id => value}}
 
-          {:mutation, {:error, _}} ->
+          {:mutation, {:error, _reason}} ->
             {{:completed_immediate, value}, %{request_id => value}}
 
-          {:mutation, {:ok, _}} ->
+          {:mutation, {:ok, _result}} ->
             {{:completed_awaiting_transition, ts, value}, %{}}
         end
 
@@ -107,7 +115,7 @@ defmodule Convex.Sync.RequestManager do
     compare_timestamp(replay_ts(left), replay_ts(right))
   end
 
-  defp replay_ts(%Request{status: {:completed_awaiting_transition, ts, _}}), do: ts
+  defp replay_ts(%Request{status: {:completed_awaiting_transition, ts, _value}}), do: ts
   defp replay_ts(_request), do: nil
 
   defp compare_timestamp(nil, nil), do: false

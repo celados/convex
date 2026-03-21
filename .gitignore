@@ -22,6 +22,12 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 convex-*.tar
 
+# Dialyzer PLT cache
+/priv/plts/
+
+# ExDNA cache
+.ex_dna_cache
+
 # IDE
 .elixir_ls/
 .vscode/

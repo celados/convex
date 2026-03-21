@@ -2,24 +2,24 @@ defmodule Convex.Protocol.MessagesTest do
   use ExUnit.Case, async: true
 
   alias Convex.Protocol.Messages.{
-    StateVersion,
+    Action,
+    ActionResponse,
     Add,
-    Remove,
+    Authenticate,
+    AuthError,
     Connect,
+    FatalError,
     ModifyQuerySet,
     Mutation,
-    Action,
-    Authenticate,
-    QueryUpdated,
+    MutationResponse,
+    Ping,
     QueryFailed,
     QueryRemoved,
+    QueryUpdated,
+    Remove,
+    StateVersion,
     Transition,
-    MutationResponse,
-    ActionResponse,
-    TransitionChunk,
-    AuthError,
-    FatalError,
-    Ping
+    TransitionChunk
   }
 
   @enforced_structs [

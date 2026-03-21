@@ -5,7 +5,7 @@ defmodule Convex.Transport.WebSocketTest do
 
   test "send_text failure closes the transport and notifies the owner" do
     {port, server} =
-      start_server(fn socket ->
+      start_server(fn socket, _request ->
         receive do
           {:stop, caller} ->
             :gen_tcp.close(socket)
@@ -40,7 +40,7 @@ defmodule Convex.Transport.WebSocketTest do
 
   test "invalid websocket frames close the transport and notify the owner" do
     {port, server} =
-      start_server(fn socket ->
+      start_server(fn socket, _request ->
         Process.sleep(50)
         :ok = :gen_tcp.send(socket, <<0x83, 0x00>>)
 
@@ -67,6 +67,70 @@ defmodule Convex.Transport.WebSocketTest do
     assert_receive :server_stopped, 1_000
   end
 
+  test "upgrade request includes Convex-Client header" do
+    parent = self()
+
+    {port, server} =
+      start_server(fn socket, request ->
+        send(parent, {:upgrade_request, request})
+
+        receive do
+          {:stop, caller} ->
+            :gen_tcp.close(socket)
+            send(caller, :server_stopped)
+        after
+          1_000 ->
+            :gen_tcp.close(socket)
+        end
+      end)
+
+    {:ok, transport} =
+      WebSocket.start_link(
+        owner: self(),
+        url: "ws://localhost:#{port}/socket",
+        headers: [{"Convex-Client", "elixir-test"}]
+      )
+
+    assert_receive {:convex_transport, ^transport, :connected}
+    assert_receive {:upgrade_request, request}, 1_000
+    assert String.downcase(request) =~ "\r\nconvex-client: elixir-test\r\n"
+
+    send(server, {:stop, self()})
+    assert_receive :server_stopped, 1_000
+  end
+
+  test "server close frame triggers client close handshake and owner notification" do
+    parent = self()
+
+    {port, server} =
+      start_server(fn socket, _request ->
+        Process.sleep(50)
+        :ok = :gen_tcp.send(socket, <<0x88, 0x00>>)
+
+        {:ok, reply} = :gen_tcp.recv(socket, 0, 1_000)
+        send(parent, {:client_close_frame, reply})
+
+        receive do
+          {:stop, caller} ->
+            :gen_tcp.close(socket)
+            send(caller, :server_stopped)
+        after
+          1_000 ->
+            :gen_tcp.close(socket)
+        end
+      end)
+
+    {:ok, transport} = WebSocket.start_link(owner: self(), url: "ws://localhost:#{port}/socket")
+    assert_receive {:convex_transport, ^transport, :connected}
+
+    assert_receive {:client_close_frame, reply}, 1_000
+    assert close_frame?(reply)
+    assert_receive {:convex_transport, ^transport, {:closed, :normal}}, 1_000
+
+    send(server, {:stop, self()})
+    assert_receive :server_stopped, 1_000
+  end
+
   defp start_server(on_socket) do
     {:ok, listener} =
       :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
@@ -82,7 +146,7 @@ defmodule Convex.Transport.WebSocketTest do
         key = extract_websocket_key(request)
         :ok = :gen_tcp.send(socket, handshake_response(key))
 
-        on_socket.(socket)
+        on_socket.(socket, request)
       end)
 
     {port, server}
@@ -98,7 +162,7 @@ defmodule Convex.Transport.WebSocketTest do
   end
 
   defp extract_websocket_key(request) do
-    [_, key] = Regex.run(~r/\r\nsec-websocket-key:\s*([^\r\n]+)/i, request)
+    [_full_match, key] = Regex.run(~r/\r\nsec-websocket-key:\s*([^\r\n]+)/i, request)
     key
   end
 
@@ -141,4 +205,12 @@ defmodule Convex.Transport.WebSocketTest do
     :gen_tcp.close(client_socket)
     client_socket
   end
+
+  defp close_frame?(<<first, second, _rest::binary>>) do
+    opcode = Bitwise.band(first, 0x0F)
+    masked? = Bitwise.band(second, 0x80) == 0x80
+    opcode == 0x8 and masked?
+  end
+
+  defp close_frame?(_data), do: false
 end

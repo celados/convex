@@ -64,7 +64,7 @@ defmodule Convex.Value do
     end
   end
 
-  def validate_field_name(_), do: {:error, "Field name must be a string"}
+  def validate_field_name(_name), do: {:error, "Field name must be a string"}
 
   @spec encode_i64(integer()) :: String.t()
   def encode_i64(value) when is_integer(value) do
@@ -80,7 +80,7 @@ defmodule Convex.Value do
       {:ok, value}
     else
       :error -> {:error, "Invalid base64 Int64 payload"}
-      _ -> {:error, "Int64 payload must be exactly 8 bytes"}
+      _byte_size -> {:error, "Int64 payload must be exactly 8 bytes"}
     end
   end
 
@@ -99,7 +99,7 @@ defmodule Convex.Value do
       {:ok, value}
     else
       :error -> {:error, "Invalid base64 u64 payload"}
-      _ -> {:error, "u64 payload must be exactly 8 bytes"}
+      _byte_size -> {:error, "u64 payload must be exactly 8 bytes"}
     end
   end
 
@@ -111,7 +111,7 @@ defmodule Convex.Value do
 
   @spec special_float?(float()) :: boolean()
   def special_float?(value) when is_float(value) do
-    negative_zero?(value) or value != value or bits_are_infinite?(value)
+    negative_zero?(value) or bits_are_nan?(value) or bits_are_infinite?(value)
   end
 
   defp do_encode(nil), do: {:ok, nil}
@@ -153,12 +153,12 @@ defmodule Convex.Value do
             {:halt, {:error, reason}}
         end
 
-      {_key, _nested}, _ ->
+      {_key, _nested}, _acc ->
         {:halt, {:error, "Object keys must be strings"}}
     end)
   end
 
-  defp do_encode(_), do: {:error, "Unsupported Convex value"}
+  defp do_encode(_value), do: {:error, "Unsupported Convex value"}
 
   defp do_decode(nil), do: {:ok, nil}
   defp do_decode(value) when is_boolean(value), do: {:ok, value}
@@ -189,7 +189,7 @@ defmodule Convex.Value do
       end
     else
       :error -> {:error, "Invalid base64 Float64 payload"}
-      _ -> {:error, "Float64 payload must be exactly 8 bytes"}
+      _byte_size -> {:error, "Float64 payload must be exactly 8 bytes"}
     end
   end
 
@@ -215,7 +215,7 @@ defmodule Convex.Value do
     end)
   end
 
-  defp do_decode(_), do: {:error, "Unsupported JSON value"}
+  defp do_decode(_value), do: {:error, "Unsupported JSON value"}
 
   defp encode_list([], acc), do: {:ok, Enum.reverse(acc)}
 
@@ -240,6 +240,13 @@ defmodule Convex.Value do
   defp decode_regular_float_tagged(bits) do
     <<decoded::float-little-64>> = <<bits::unsigned-little-64>>
     {:error, "Float64 should be encoded as a number: #{decoded}"}
+  end
+
+  defp bits_are_nan?(value) do
+    <<bits::unsigned-64>> = <<value::float-64>>
+    exponent = Bitwise.band(Bitwise.bsr(bits, 52), 0x7FF)
+    mantissa = Bitwise.band(bits, 0xFFFFFFFFFFFFF)
+    exponent == 0x7FF and mantissa != 0
   end
 
   defp bits_are_infinite?(value) do
