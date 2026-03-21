@@ -13,5 +13,8 @@ defmodule Convex do
   defdelegate unsubscribe(client, subscription), to: Client
   defdelegate watch_all(client, opts \\ []), to: Client
   defdelegate unwatch_all(client, watch), to: Client
+  defdelegate connection_state(client), to: Client
+  defdelegate watch_connection_state(client, opts \\ []), to: Client
+  defdelegate unwatch_connection_state(client, watch), to: Client
   defdelegate set_auth(client, token), to: Client
 end

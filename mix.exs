@@ -31,7 +31,8 @@ defmodule Convex.MixProject do
   defp deps do
     [
       {:jason, "~> 1.4"},
-      {:websockex, git: "https://github.com/witchtails/websockex_wt.git", branch: "master"}
+      {:mint_web_socket, "~> 1.0"},
+      {:castore, "~> 1.0"}
     ]
   end
 end

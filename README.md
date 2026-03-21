@@ -4,11 +4,14 @@ Pure Elixir client for [Convex](https://convex.dev) — the backend application 
 
 Connects to Convex deployments over WebSocket using the native sync protocol. Supports queries, mutations, actions, real-time subscriptions, authentication, and automatic reconnection with exponential backoff.
 
+Open follow-up work and conscious tradeoffs are tracked in [TODO.md](./TODO.md).
+
 ## Features
 
 - **Pure Elixir** — no NIFs, no Rust dependencies
 - **Real-time subscriptions** — live query results pushed to your processes
 - **Consistent snapshots** — `watch_all` delivers atomic multi-query views
+- **Connection state notifications** — read or watch `:connecting` / `:connected`
 - **Automatic reconnection** — exponential backoff with jitter, full state replay on reconnect
 - **Auth support** — static tokens, callback-based token fetchers, admin auth
 - **Clean architecture** — pure state machine core (`Convex.Sync.Core`), effects at the edges
@@ -76,6 +79,31 @@ end
 
 Convex.unwatch_all(client, watch)
 ```
+
+## Connection State
+
+Read the current connection state synchronously:
+
+```elixir
+Convex.connection_state(client)
+# => :connecting | :connected
+```
+
+Or watch for future transitions:
+
+```elixir
+{:ok, watch} = Convex.watch_connection_state(client)
+
+receive do
+  {:convex_connection_state, ref, state} ->
+    IO.inspect({ref, state}, label: "connection state")
+end
+
+Convex.unwatch_connection_state(client, watch)
+```
+
+`watch_connection_state/1` only emits changes after subscription. If you need the
+current value immediately, call `connection_state/1`.
 
 ## Authentication
 

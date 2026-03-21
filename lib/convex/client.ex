@@ -21,6 +21,11 @@ defmodule Convex.Client do
     defstruct [:ref]
   end
 
+  defmodule ConnectionWatch do
+    @enforce_keys [:ref]
+    defstruct [:ref]
+  end
+
   defstruct [
     :deployment_url,
     :ws_url,
@@ -39,13 +44,17 @@ defmodule Convex.Client do
     :pending_queries,
     :subscriptions,
     :watchers,
+    :connection_watchers,
     :backoff,
     :auth_fetcher,
     :auth_token,
     :connection_state,
+    :monotonic_clock,
+    :system_clock,
     :core
   ]
 
+  @type connection_state :: :connecting | :connected
   @type function_result :: Core.function_result()
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -93,10 +102,32 @@ defmodule Convex.Client do
     GenServer.call(client, {:unwatch_all, watch})
   end
 
+  @spec connection_state(pid()) :: connection_state()
+  def connection_state(client) do
+    GenServer.call(client, :connection_state)
+  end
+
+  @spec watch_connection_state(pid(), keyword()) :: {:ok, ConnectionWatch.t()}
+  def watch_connection_state(client, opts \\ []) do
+    GenServer.call(
+      client,
+      {:watch_connection_state, self(), opts},
+      Keyword.get(opts, :timeout, 30_000)
+    )
+  end
+
+  @spec unwatch_connection_state(pid(), ConnectionWatch.t()) :: :ok
+  def unwatch_connection_state(client, %ConnectionWatch{} = watch) do
+    GenServer.call(client, {:unwatch_connection_state, watch})
+  end
+
   @spec set_auth(pid(), String.t() | nil) :: :ok | {:error, String.t()}
   def set_auth(client, token) do
     GenServer.call(client, {:set_auth, token})
   end
+
+  def default_monotonic_clock, do: System.monotonic_time(:millisecond)
+  def default_system_clock, do: System.system_time(:millisecond)
 
   @impl true
   def init(opts) do
@@ -106,6 +137,8 @@ defmodule Convex.Client do
     inactivity_check_ms = Keyword.get(opts, :inactivity_check_ms, 5_000)
     inactivity_timeout_ms = Keyword.get(opts, :inactivity_timeout_ms, 30_000)
     auth_fetcher = Keyword.get(opts, :auth_fetcher)
+    monotonic_clock = Keyword.get(opts, :monotonic_clock, &__MODULE__.default_monotonic_clock/0)
+    system_clock = Keyword.get(opts, :system_clock, &__MODULE__.default_system_clock/0)
 
     state = %__MODULE__{
       deployment_url: deployment_url,
@@ -116,7 +149,7 @@ defmodule Convex.Client do
       session_id: uuid4(),
       connection_count: 0,
       last_close_reason: "InitialConnect",
-      last_server_response_ms: monotonic_ms(),
+      last_server_response_ms: monotonic_clock.(),
       inactivity_check_ms: inactivity_check_ms,
       inactivity_timeout_ms: inactivity_timeout_ms,
       pending_reconnect_timer: nil,
@@ -125,10 +158,13 @@ defmodule Convex.Client do
       pending_queries: %{},
       subscriptions: %{},
       watchers: %{},
+      connection_watchers: %{},
       backoff: Backoff.new(Keyword.get(opts, :backoff, [])),
       auth_fetcher: auth_fetcher,
       auth_token: Keyword.get(opts, :auth_token),
       connection_state: :connecting,
+      monotonic_clock: monotonic_clock,
+      system_clock: system_clock,
       core: Core.new()
     }
 
@@ -197,6 +233,22 @@ defmodule Convex.Client do
 
   def handle_call({:unwatch_all, %Watch{ref: ref}}, _from, state) do
     {:reply, :ok, %{state | watchers: Map.delete(state.watchers, ref)}}
+  end
+
+  def handle_call(:connection_state, _from, state) do
+    {:reply, state.connection_state, state}
+  end
+
+  def handle_call({:watch_connection_state, owner, _opts}, _from, state) do
+    ref = make_ref()
+    watch = %ConnectionWatch{ref: ref}
+
+    {:reply, {:ok, watch},
+     %{state | connection_watchers: Map.put(state.connection_watchers, ref, owner)}}
+  end
+
+  def handle_call({:unwatch_connection_state, %ConnectionWatch{ref: ref}}, _from, state) do
+    {:reply, :ok, %{state | connection_watchers: Map.delete(state.connection_watchers, ref)}}
   end
 
   def handle_call({:set_auth, token}, _from, state) do
@@ -335,7 +387,7 @@ defmodule Convex.Client do
   def handle_info(:check_inactivity, state) do
     state =
       if state.connection_state == :connected and
-           monotonic_ms() - state.last_server_response_ms >= state.inactivity_timeout_ms do
+           state.monotonic_clock.() - state.last_server_response_ms >= state.inactivity_timeout_ms do
         reconnect(state, "InactiveServer")
       else
         state
@@ -360,10 +412,13 @@ defmodule Convex.Client do
       max_observed_timestamp: state.core.max_observed_timestamp,
       # `clientTs` is sent to the server for clock skew estimation and must be wall clock;
       # monotonic clocks are only suitable for local timeout/interval checks.
-      client_ts: system_ms()
+      client_ts: state.system_clock.()
     }
 
-    state = %{state | connection_state: :connected, last_server_response_ms: monotonic_ms()}
+    state = %{
+      state
+      | last_server_response_ms: state.monotonic_clock.()
+    }
 
     case dispatch_messages(state, [connect_message]) do
       {:ok, state} ->
@@ -386,7 +441,7 @@ defmodule Convex.Client do
         }
 
         case dispatch_messages(state, messages) do
-          {:ok, state} -> {:noreply, state}
+          {:ok, state} -> {:noreply, transition_connection_state(state, :connected)}
           {:error, reason} -> {:noreply, reconnect(state, "EncodeError: #{reason}")}
         end
 
@@ -403,7 +458,7 @@ defmodule Convex.Client do
 
     state = %{
       state
-      | last_server_response_ms: monotonic_ms(),
+      | last_server_response_ms: state.monotonic_clock.(),
         backoff: Backoff.reset(state.backoff)
     }
 
@@ -432,7 +487,7 @@ defmodule Convex.Client do
       ) do
     {:noreply,
      schedule_reconnect(
-       %{state | transport_pid: nil, connection_state: :connecting},
+       %{state | transport_pid: nil},
        inspect(reason)
      )}
   end
@@ -534,7 +589,7 @@ defmodule Convex.Client do
       _ = state.transport_module.close(state.transport_pid)
     end
 
-    schedule_reconnect(%{state | transport_pid: nil, connection_state: :connecting}, reason)
+    schedule_reconnect(%{state | transport_pid: nil}, reason)
   end
 
   defp schedule_reconnect(state, reason) do
@@ -544,7 +599,11 @@ defmodule Convex.Client do
 
     {delay, backoff} = Backoff.next_delay(state.backoff)
     timer = Process.send_after(self(), :reconnect_now, delay)
-    %{state | backoff: backoff, last_close_reason: reason, pending_reconnect_timer: timer}
+
+    state =
+      %{state | backoff: backoff, last_close_reason: reason, pending_reconnect_timer: timer}
+
+    transition_connection_state(state, :connecting)
   end
 
   defp schedule_inactivity_check(state) do
@@ -559,14 +618,6 @@ defmodule Convex.Client do
   defp sync_url("https://" <> rest), do: "wss://" <> rest <> "/api/sync"
   defp sync_url("http://" <> rest), do: "ws://" <> rest <> "/api/sync"
   defp sync_url(url), do: url <> "/api/sync"
-
-  defp monotonic_ms do
-    System.monotonic_time(:millisecond)
-  end
-
-  defp system_ms do
-    System.system_time(:millisecond)
-  end
 
   defp validate_args(args) when is_map(args) do
     case Value.encode(args) do
@@ -611,6 +662,18 @@ defmodule Convex.Client do
 
   defp apply_initial_auth(core, :no_auth), do: core
   defp apply_initial_auth(core, {:token, token}), do: Core.set_auth(core, token)
+
+  defp transition_connection_state(state, new_state) do
+    if state.connection_state == new_state do
+      state
+    else
+      Enum.each(state.connection_watchers, fn {ref, owner} ->
+        send(owner, {:convex_connection_state, ref, new_state})
+      end)
+
+      %{state | connection_state: new_state}
+    end
+  end
 
   defp dispatch_messages!(state, messages) do
     case dispatch_messages(state, messages) do
