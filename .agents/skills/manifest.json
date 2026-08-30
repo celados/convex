@@ -1,0 +1,15 @@
+{
+  "version": 3,
+  "items": [
+    {
+      "type": "skills",
+      "repo": "celados/agents",
+      "skills": [
+        {
+          "id": "elixir",
+          "source": "skills/elixir"
+        }
+      ]
+    }
+  ]
+}

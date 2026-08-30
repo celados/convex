@@ -37,6 +37,5 @@ convex-*.tar
 
 # Agents / skills workspace
 .agentspace/
-.agents/
 .claude/
 skills-lock.json
