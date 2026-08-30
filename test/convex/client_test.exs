@@ -776,6 +776,34 @@ defmodule Convex.ClientTest do
            end)
   end
 
+  test "protocol reconnect cancels an unresolved auth fetch" do
+    test_pid = self()
+
+    fetcher = fn _options ->
+      send(test_pid, {:blocking_fetch, self()})
+
+      receive do
+        :release -> {:ok, Auth.Token.user("jwt")}
+      end
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        inactivity_timeout_ms: 0,
+        backoff: [rng: fn -> 0.0 end],
+        auth_fetcher: fetcher
+      )
+
+    assert_receive {:blocking_fetch, fetch_pid}
+    transport = wait_for_transport(client)
+    send(client, {:convex_transport, transport, {:text, "{"}})
+
+    wait_until(fn -> not Process.alive?(fetch_pid) end)
+  end
+
   test "set_auth persists across reconnect without auth_fetcher" do
     {:ok, client} =
       Client.start_link(

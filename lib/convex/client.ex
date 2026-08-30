@@ -690,6 +690,10 @@ defmodule Convex.Client do
       _result = state.transport_module.close(state.transport_pid)
     end
 
+    # The task handle must remain reachable until cancellation; clearing it
+    # first would leak a blocked fetcher across protocol-driven reconnects.
+    state = cancel_pending_auth_task(state)
+
     schedule_reconnect(
       %{
         state
