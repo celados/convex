@@ -35,6 +35,10 @@ defmodule Convex.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: [check: :test, "check.ci": :test]]
+  end
+
   defp aliases do
     [
       check: [
