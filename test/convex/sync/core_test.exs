@@ -1,7 +1,15 @@
 defmodule Convex.Sync.CoreTest do
   use ExUnit.Case, async: true
 
-  alias Convex.Protocol.Messages.{MutationResponse, QueryUpdated, StateVersion, Transition}
+  alias Convex.Protocol.Messages.{
+    ModifyQuerySet,
+    MutationResponse,
+    QueryUpdated,
+    Remove,
+    StateVersion,
+    Transition
+  }
+
   alias Convex.Sync.Core
 
   test "duplicate subscribe reuses query and emits no extra server message" do
@@ -45,6 +53,30 @@ defmodule Convex.Sync.CoreTest do
 
     assert {:ok, _state, %{0 => {:ok, [%{"body" => "hi"}]}}, %{0 => {:ok, %{"ok" => true}}}} =
              Core.receive_message(state, transition)
+  end
+
+  test "final unsubscribe clears the cached query result" do
+    state = Core.new()
+    {state, subscriber, nil} = Core.subscribe(state, "messages:list", %{})
+    {state, _messages} = Core.take_outbox(state)
+
+    assert {:ok, state, %{0 => {:ok, []}}, %{}} =
+             Core.receive_message(
+               state,
+               %Transition{
+                 start_version: %StateVersion{query_set: 0, identity: 0, ts: 0},
+                 end_version: %StateVersion{query_set: 1, identity: 0, ts: 1},
+                 modifications: [%QueryUpdated{query_id: 0, value: [], log_lines: []}]
+               }
+             )
+
+    assert state.latest_results == %{0 => {:ok, []}}
+
+    assert {:ok, state} = Core.unsubscribe(state, subscriber)
+    {_state, [%ModifyQuerySet{} = unsubscribe]} = Core.take_outbox(state)
+
+    assert unsubscribe.modifications == [%Remove{query_id: 0}]
+    assert state.latest_results == %{}
   end
 
   test "rebuild for reconnect replays auth, queries, and pending requests" do

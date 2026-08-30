@@ -25,7 +25,7 @@ Each item should answer:
 | `@moduledoc` on public types (Int64, Bytes, ConvexError) | Done | |
 | `@moduledoc false` on internal modules | Done | Protocol.Optional was missing it |
 | Trailing-slash defense in `sync_url/1` | Done | Codex fix |
-| Confirm GitHub repo URL in mix.exs | Blocked | Repo not yet created; update `@source_url` when available |
+| Confirm GitHub repo URL in mix.exs | Done | Repository transferred to `celados/convex` |
 | Update README installation to hex dep | Blocked | Can't do until first `mix hex.publish` succeeds |
 | Hex.pm account + API key | Blocked | Requires manual `mix hex.user register` or `mix hex.user auth` |
 | `ex_doc` dependency for hexdocs | Not started | Add `{:ex_doc, "~> 0.35", only: :dev, runtime: false}` when ready |
@@ -43,3 +43,8 @@ No spec-compliance issues found. Three minor improvements identified and applied
 
 - Decision: backend clients should not expose optimistic updates.
 - Rationale: optimistic updates trade correctness for perceived latency. Frontend UIs can tolerate a rollback; backend logic acting on unconfirmed state risks irreversible side effects. The `optimistic_results` field in Core remains an unused placeholder — it may be removed in a future cleanup.
+
+### [x] Sync against official `convex-rs` — completed 2026-08-30
+
+- Audited the Elixir implementation against `get-convex/convex-rs@e4eb7e2` at its March baseline and `a0fd168` at upstream `main`.
+- The only client-semantic change was clearing a query's cached result when its last subscriber drops. Elixir already did this; the Core regression test now locks the behavior.

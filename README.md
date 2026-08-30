@@ -21,7 +21,7 @@ Open follow-up work and conscious tradeoffs are tracked in [TODO.md](./TODO.md).
 ```elixir
 def deps do
   [
-    {:convex, git: "https://github.com/ethan-huo/convex.git"}
+    {:convex, git: "https://github.com/celados/convex.git"}
   ]
 end
 ```

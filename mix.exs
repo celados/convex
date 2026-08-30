@@ -2,7 +2,7 @@ defmodule Convex.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/anthropic-engineering/convex-elixir"
+  @source_url "https://github.com/celados/convex"
 
   def project do
     [
