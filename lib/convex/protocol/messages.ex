@@ -51,8 +51,8 @@ defmodule Convex.Protocol.Messages do
 
   defmodule Authenticate do
     @moduledoc false
-    @enforce_keys [:base_version, :token_type]
-    defstruct [:base_version, :token_type, :value, acting_as: :absent]
+    @enforce_keys [:base_version, :token]
+    defstruct [:base_version, :token]
   end
 
   defmodule QueryUpdated do

@@ -22,6 +22,8 @@ defmodule Convex.Protocol.Codec do
     TransitionChunk
   }
 
+  alias Convex.Auth.Identity
+  alias Convex.Auth.Token
   alias Convex.Protocol.Optional
   alias Convex.Value
 
@@ -79,16 +81,9 @@ defmodule Convex.Protocol.Codec do
   end
 
   def encode_client_message(%Authenticate{} = message) do
-    base =
-      %{
-        "type" => "Authenticate",
-        "baseVersion" => message.base_version,
-        "tokenType" => message.token_type
-      }
-      |> maybe_put("value", message.value)
-      |> optional_put("actingAs", message.acting_as)
-
-    {:ok, base}
+    with {:ok, token} <- encode_token(message.token) do
+      {:ok, Map.merge(%{"type" => "Authenticate", "baseVersion" => message.base_version}, token)}
+    end
   end
 
   @spec encode_client_message_json(struct()) :: {:ok, binary()} | {:error, String.t()}
@@ -219,6 +214,32 @@ defmodule Convex.Protocol.Codec do
   defp encode_modification(%Remove{} = modification) do
     {:ok, %{"type" => "Remove", "queryId" => modification.query_id}}
   end
+
+  defp encode_token(%Token{type: :user, credential: credential, acting_as: nil})
+       when is_binary(credential) and credential != "" do
+    {:ok, %{"tokenType" => "User", "value" => credential}}
+  end
+
+  defp encode_token(%Token{type: :admin, credential: credential, acting_as: nil})
+       when is_binary(credential) and credential != "" do
+    {:ok, %{"tokenType" => "Admin", "value" => credential}}
+  end
+
+  defp encode_token(%Token{
+         type: :admin,
+         credential: credential,
+         acting_as: %Identity{} = identity
+       })
+       when is_binary(credential) and credential != "" do
+    with {:ok, acting_as} <- Identity.serialize(identity) do
+      {:ok, %{"tokenType" => "Admin", "value" => credential, "actingAs" => acting_as}}
+    end
+  end
+
+  defp encode_token(%Token{type: :none, credential: nil, acting_as: nil}),
+    do: {:ok, %{"tokenType" => "None"}}
+
+  defp encode_token(_token), do: {:error, "Invalid authentication token"}
 
   defp encode_args(args) when is_map(args) do
     with {:ok, encoded} <- Value.encode(args) do

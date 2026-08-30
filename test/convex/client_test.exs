@@ -1,7 +1,10 @@
 defmodule Convex.ClientTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+  alias Convex.Auth
   alias Convex.Client
+  alias Convex.Sync.Core
   alias Convex.Transport.Mock
 
   defmodule FailingTransport do
@@ -43,6 +46,10 @@ defmodule Convex.ClientTest do
       GenServer.cast(pid, :connect)
     end
 
+    def messages(pid) do
+      GenServer.call(pid, :messages)
+    end
+
     @impl true
     def init(opts) do
       owner = Keyword.fetch!(opts, :owner)
@@ -62,6 +69,11 @@ defmodule Convex.ClientTest do
     def handle_cast(:close, state) do
       send(state.owner, {:convex_transport, self(), {:closed, :normal}})
       {:stop, :normal, state}
+    end
+
+    @impl true
+    def handle_call(:messages, _from, state) do
+      {:reply, Enum.reverse(state.sent_messages), state}
     end
   end
 
@@ -187,7 +199,7 @@ defmodule Convex.ClientTest do
         deployment_url: "http://localhost:3210",
         transport_module: ControlledTransport,
         inactivity_check_ms: 100_000,
-        backoff: [rng: fn -> 0.0 end]
+        backoff: [rng: fn -> 1.0 end]
       )
 
     assert Client.connection_state(client) == :connecting
@@ -317,7 +329,7 @@ defmodule Convex.ClientTest do
         inactivity_check_ms: 100_000,
         auth_fetcher: fn force_refresh: force_refresh ->
           refute force_refresh
-          "jwt-initial"
+          {:ok, Auth.Token.user("jwt-initial")}
         end
       )
 
@@ -329,6 +341,439 @@ defmodule Convex.ClientTest do
         payload["type"] == "Authenticate" and payload["value"] == "jwt-initial"
       end)
     end)
+  end
+
+  test "set_admin_auth sends an admin impersonation message" do
+    identity = Auth.Identity.new(token_identifier: "convex|user")
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000
+      )
+
+    transport = wait_for_transport(client)
+    assert :ok = Client.set_admin_auth(client, "deploy-key", identity)
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(fn payload ->
+        payload["type"] == "Authenticate" and payload["tokenType"] == "Admin" and
+          payload["actingAs"]["tokenIdentifier"] == "convex|user"
+      end)
+    end)
+  end
+
+  test "business messages wait for asynchronous authentication" do
+    test_pid = self()
+
+    fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:auth_fetch, self(), force_refresh})
+
+      receive do
+        {:release, result} -> result
+      after
+        5_000 -> {:error, :timeout}
+      end
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        auth_fetcher: fetcher
+      )
+
+    transport = wait_for_transport(client)
+    assert_receive {:auth_fetch, fetcher_pid, false}
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(&(&1["type"] == "Connect"))
+    end)
+
+    task = Task.async(fn -> Client.subscribe(client, "messages:list", %{}) end)
+    Process.sleep(50)
+    assert Mock.sent_messages(transport) |> Enum.map(& &1["type"]) == ["Connect"]
+
+    send(fetcher_pid, {:release, {:ok, Auth.Token.user("jwt-secret")}})
+    assert {:ok, _subscription} = Task.await(task, 1_000)
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.map(& &1["type"])
+      |> Enum.count(&(&1 == "ModifyQuerySet")) == 1
+    end)
+
+    assert ["Connect", "Authenticate", "ModifyQuerySet"] =
+             Mock.sent_messages(transport) |> Enum.map(& &1["type"])
+  end
+
+  test "static auth can replace an unresolved initial fetcher" do
+    test_pid = self()
+
+    fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:unresolved_initial_fetch, self(), force_refresh})
+
+      receive do
+        {:release, result} -> result
+      after
+        5_000 -> {:error, :timeout}
+      end
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        auth_fetcher: fetcher
+      )
+
+    transport = wait_for_transport(client)
+    assert_receive {:unresolved_initial_fetch, old_fetch_pid, false}
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(&(&1["type"] == "Connect"))
+    end)
+
+    assert :ok = Client.set_auth(client, "jwt-replacement")
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(&(&1["type"] == "Authenticate"))
+    end)
+
+    assert [
+             %{"type" => "Connect"},
+             %{"type" => "Authenticate", "baseVersion" => 0, "value" => "jwt-replacement"}
+           ] =
+             Mock.sent_messages(transport)
+
+    refute Process.alive?(old_fetch_pid)
+    send(old_fetch_pid, {:release, {:ok, Auth.Token.user("jwt-old")}})
+    Process.sleep(50)
+    assert Enum.count(Mock.sent_messages(transport), &(&1["type"] == "Authenticate")) == 1
+  end
+
+  test "a fetcher can replace an unresolved initial fetcher without losing queued work" do
+    test_pid = self()
+
+    initial_fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:initial_fetcher, self(), force_refresh})
+
+      receive do
+        {:release, result} -> result
+      after
+        5_000 -> {:error, :timeout}
+      end
+    end
+
+    replacement_fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:replacement_fetcher, self(), force_refresh})
+      {:ok, Auth.Token.user("jwt-replacement")}
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        auth_fetcher: initial_fetcher
+      )
+
+    transport = wait_for_transport(client)
+    assert_receive {:initial_fetcher, old_fetch_pid, false}
+    task = Task.async(fn -> Client.subscribe(client, "messages:list", %{}) end)
+    Process.sleep(50)
+    assert Mock.sent_messages(transport) |> Enum.map(& &1["type"]) == ["Connect"]
+
+    assert :ok = Client.set_auth_fetcher(client, replacement_fetcher)
+    assert_receive {:replacement_fetcher, _replacement_pid, false}
+    assert {:ok, _subscription} = Task.await(task, 1_000)
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(&(&1["type"] == "ModifyQuerySet"))
+    end)
+
+    assert ["Connect", "Authenticate", "ModifyQuerySet"] =
+             Mock.sent_messages(transport) |> Enum.map(& &1["type"])
+
+    send(old_fetch_pid, {:release, {:ok, Auth.Token.user("jwt-old")}})
+    Process.sleep(50)
+    assert Enum.count(Mock.sent_messages(transport), &(&1["type"] == "Authenticate")) == 1
+  end
+
+  test "anonymous connections remain at identity version zero" do
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000
+      )
+
+    transport = wait_for_transport(client)
+
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(&(&1["type"] == "Connect"))
+    end)
+
+    assert Mock.sent_messages(transport) |> Enum.map(& &1["type"]) == ["Connect"]
+  end
+
+  test "static auth set before the first connection authenticates once at base version zero" do
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: ControlledTransport,
+        inactivity_check_ms: 100_000
+      )
+
+    transport = wait_for_transport(client)
+    assert :ok = Client.set_auth(client, "jwt-secret")
+    ControlledTransport.connect(transport)
+
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    wait_until(fn -> length(ControlledTransport.messages(transport)) == 2 end)
+
+    assert [
+             %{"type" => "Connect"},
+             %{"type" => "Authenticate", "baseVersion" => 0, "tokenType" => "User"}
+           ] =
+             ControlledTransport.messages(transport) |> Enum.map(&Jason.decode!(&1))
+  end
+
+  test "runtime fetcher replacement revokes the old credential before fetching" do
+    test_pid = self()
+
+    fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:runtime_fetch, self(), force_refresh})
+
+      receive do
+        {:release, result} -> result
+      after
+        5_000 -> {:error, :timeout}
+      end
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: ControlledTransport,
+        inactivity_check_ms: 100_000,
+        auth: Auth.Token.user("jwt-old")
+      )
+
+    transport = wait_for_transport(client)
+    ControlledTransport.connect(transport)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    {:ok, watch} = Client.watch_connection_state(client)
+    watch_ref = watch.ref
+
+    assert :ok = Client.set_auth_fetcher(client, fetcher)
+    assert_receive {:runtime_fetch, fetcher_pid, false}
+
+    task = Task.async(fn -> Client.subscribe(client, "messages:list", %{}) end)
+    Process.sleep(50)
+
+    assert [
+             %{"type" => "Connect"},
+             %{"type" => "Authenticate", "baseVersion" => 0},
+             %{"type" => "Authenticate", "baseVersion" => 1, "tokenType" => "None"}
+           ] =
+             ControlledTransport.messages(transport) |> Enum.map(&Jason.decode!(&1))
+
+    assert_receive {:convex_connection_state, ^watch_ref, :connecting}
+    send(fetcher_pid, {:release, {:ok, Auth.Token.admin("deploy-key")}})
+    assert {:ok, _subscription} = Task.await(task, 1_000)
+    assert_receive {:convex_connection_state, ^watch_ref, :connected}
+
+    wait_until(fn ->
+      ControlledTransport.messages(transport)
+      |> Enum.map(&Jason.decode!(&1))
+      |> Enum.any?(fn payload -> payload["type"] == "ModifyQuerySet" end)
+    end)
+
+    messages = ControlledTransport.messages(transport) |> Enum.map(&Jason.decode!(&1))
+    assert Enum.at(messages, 3)["type"] == "Authenticate"
+    assert Enum.at(messages, 3)["baseVersion"] == 2
+    assert Enum.at(messages, 3)["tokenType"] == "Admin"
+    assert Enum.at(messages, 4)["type"] == "ModifyQuerySet"
+    refute_receive {:convex_connection_state, ^watch_ref, _}, 50
+  end
+
+  test "logout replaces a fetcher and its identity cannot return on reconnect" do
+    auth_fetcher = fn force_refresh: force_refresh ->
+      if force_refresh,
+        do: {:ok, Auth.Token.user("jwt-refreshed")},
+        else: {:ok, Auth.Token.user("jwt-initial")}
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        backoff: [rng: fn -> 0.0 end],
+        auth_fetcher: auth_fetcher
+      )
+
+    transport = wait_for_transport(client)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    assert :ok = Client.set_auth(client, nil)
+
+    wait_until(fn ->
+      Mock.sent_messages(transport)
+      |> Enum.any?(fn payload ->
+        payload["type"] == "Authenticate" and payload["tokenType"] == "None"
+      end)
+    end)
+
+    Mock.close(transport)
+    new_transport = wait_until_value(fn -> current_transport_pid(client, transport) end)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+
+    wait_until(fn ->
+      Mock.sent_messages(new_transport)
+      |> Enum.any?(&(&1["type"] == "Connect"))
+    end)
+
+    assert Mock.sent_messages(new_transport) |> Enum.map(& &1["type"]) == ["Connect"]
+  end
+
+  test "runtime fetcher failure continues anonymously without the old credential" do
+    test_pid = self()
+
+    fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:failed_runtime_fetch, self(), force_refresh})
+
+      receive do
+        {:release, result} -> result
+      after
+        5_000 -> {:error, :timeout}
+      end
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: ControlledTransport,
+        inactivity_check_ms: 100_000,
+        auth: Auth.Token.user("jwt-old")
+      )
+
+    transport = wait_for_transport(client)
+    ControlledTransport.connect(transport)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    assert :ok = Client.set_auth_fetcher(client, fetcher)
+    assert_receive {:failed_runtime_fetch, fetcher_pid, false}
+
+    task = Task.async(fn -> Client.subscribe(client, "messages:list", %{}) end)
+    send(fetcher_pid, {:release, {:error, :network}})
+    assert {:ok, _subscription} = Task.await(task, 1_000)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+
+    wait_until(fn ->
+      ControlledTransport.messages(transport)
+      |> Enum.map(&Jason.decode!(&1))
+      |> Enum.any?(&(&1["type"] == "ModifyQuerySet"))
+    end)
+
+    messages = ControlledTransport.messages(transport) |> Enum.map(&Jason.decode!(&1))
+
+    assert [%{"type" => "Connect"}, _user_auth, _logout_auth, %{"type" => "ModifyQuerySet"}] =
+             messages
+
+    assert Enum.count(messages, &(&1["type"] == "Authenticate")) == 2
+    assert Process.alive?(client)
+  end
+
+  test "auth fetcher refresh flag is false initially and true on every reconnect" do
+    test_pid = self()
+
+    fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:refresh_sequence, force_refresh})
+      {:ok, Auth.Token.user("jwt")}
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        backoff: [rng: fn -> 0.0 end],
+        auth_fetcher: fetcher
+      )
+
+    transport = wait_for_transport(client)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    assert_received {:refresh_sequence, false}
+
+    Mock.close(transport)
+    new_transport = wait_until_value(fn -> current_transport_pid(client, transport) end)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    assert_received {:refresh_sequence, true}
+
+    Mock.close(new_transport)
+    newest_transport = wait_until_value(fn -> current_transport_pid(client, new_transport) end)
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    assert_received {:refresh_sequence, true}
+    assert newest_transport != new_transport
+  end
+
+  test "late auth fetch results do not cross connection generations" do
+    test_pid = self()
+
+    fetcher = fn force_refresh: force_refresh ->
+      send(test_pid, {:stale_fetch, self(), force_refresh})
+
+      receive do
+        {:release, result} -> result
+      after
+        5_000 -> {:error, :timeout}
+      end
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        backoff: [rng: fn -> 0.0 end],
+        auth_fetcher: fetcher
+      )
+
+    old_transport = wait_for_transport(client)
+    assert_receive {:stale_fetch, old_fetch_pid, false}
+    Mock.close(old_transport)
+    new_transport = wait_until_value(fn -> current_transport_pid(client, old_transport) end)
+    assert_receive {:stale_fetch, new_fetch_pid, true}
+    refute Process.alive?(old_fetch_pid)
+
+    send(old_fetch_pid, {:release, {:ok, Auth.Token.user("jwt-old")}})
+    Process.sleep(50)
+    assert Mock.sent_messages(new_transport) |> Enum.map(& &1["type"]) == ["Connect"]
+
+    send(new_fetch_pid, {:release, {:ok, Auth.Token.user("jwt-new")}})
+
+    wait_until(fn ->
+      Mock.sent_messages(new_transport)
+      |> Enum.any?(fn payload ->
+        payload["type"] == "Authenticate" and payload["value"] == "jwt-new"
+      end)
+    end)
+
+    refute Enum.any?(Mock.sent_messages(new_transport), fn payload ->
+             payload["type"] == "Authenticate" and payload["value"] == "jwt-old"
+           end)
   end
 
   test "set_auth persists across reconnect without auth_fetcher" do
@@ -359,11 +804,19 @@ defmodule Convex.ClientTest do
         payload["type"] == "Authenticate" and payload["value"] == "jwt-manual"
       end)
     end)
+
+    authentications =
+      Enum.filter(Mock.sent_messages(new_transport), &(&1["type"] == "Authenticate"))
+
+    assert [%{"baseVersion" => 0, "tokenType" => "User", "value" => "jwt-manual"}] =
+             authentications
   end
 
   test "auth_fetcher returning nil clears previously fetched auth on reconnect" do
     auth_fetcher = fn force_refresh: force_refresh ->
-      if force_refresh, do: nil, else: "jwt-first"
+      if force_refresh,
+        do: {:ok, Auth.Token.none()},
+        else: {:ok, Auth.Token.user("jwt-first")}
     end
 
     {:ok, client} =
@@ -522,7 +975,7 @@ defmodule Convex.ClientTest do
         deployment_url: "http://localhost:3210",
         transport_module: FailingTransport,
         inactivity_check_ms: 100_000,
-        backoff: [rng: fn -> 0.5 end]
+        backoff: [base_ms: 1_000, rng: fn -> 0.5 end]
       )
 
     Process.sleep(50)
@@ -543,6 +996,76 @@ defmodule Convex.ClientTest do
       Process.sleep(25)
       wait_until(fun, remaining - 1)
     end
+  end
+
+  test "invalid public auth input fails before reaching the client" do
+    assert_raise ArgumentError, "auth and auth_fetcher are mutually exclusive", fn ->
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        auth: Auth.Token.user("jwt"),
+        auth_fetcher: fn _opts -> {:ok, Auth.Token.none()} end
+      )
+    end
+
+    assert_raise ArgumentError, "auth_token was removed; use auth: Auth.Token.t()", fn ->
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        auth_token: "jwt"
+      )
+    end
+
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: ControlledTransport,
+        inactivity_check_ms: 100_000
+      )
+
+    transport = wait_for_transport(client)
+
+    assert_raise ArgumentError, "User credential must be a non-empty string", fn ->
+      Client.set_auth(client, :not_a_jwt)
+    end
+
+    assert ControlledTransport.messages(transport) == []
+    assert Process.alive?(client)
+  end
+
+  test "client-owned auth state does not expose credentials through inspect" do
+    {:ok, client} =
+      Client.start_link(
+        deployment_url: "http://localhost:3210",
+        transport_module: Mock,
+        inactivity_check_ms: 100_000,
+        auth: Auth.Token.user("jwt-secret-canary")
+      )
+
+    wait_until(fn -> Client.connection_state(client) == :connected end)
+    state = :sys.get_state(client)
+    authenticated_core = Core.set_auth(Core.new(), state.active_token)
+
+    refute inspect(state) =~ "jwt-secret-canary"
+    refute inspect(authenticated_core) =~ "jwt-secret-canary"
+    assert inspect(state.active_token) =~ "<redacted>"
+  end
+
+  test "auth fetcher crash diagnostics do not expose callback reasons" do
+    logs =
+      capture_log(fn ->
+        {:ok, client} =
+          Client.start_link(
+            deployment_url: "http://localhost:3210",
+            transport_module: Mock,
+            inactivity_check_ms: 100_000,
+            auth_fetcher: fn _opts -> raise "jwt-secret-canary" end
+          )
+
+        wait_until(fn -> Client.connection_state(client) == :connected end)
+        assert Process.alive?(client)
+      end)
+
+    assert logs =~ "Convex auth fetch failed; continuing anonymously"
+    refute logs =~ "jwt-secret-canary"
   end
 
   defp wait_until(_fun, 0), do: flunk("condition not met in time")

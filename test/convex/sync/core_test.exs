@@ -1,6 +1,8 @@
 defmodule Convex.Sync.CoreTest do
   use ExUnit.Case, async: true
 
+  alias Convex.Auth
+
   alias Convex.Protocol.Messages.{
     ModifyQuerySet,
     MutationResponse,
@@ -81,16 +83,33 @@ defmodule Convex.Sync.CoreTest do
 
   test "rebuild for reconnect replays auth, queries, and pending requests" do
     state = Core.new()
-    state = Core.set_auth(state, "jwt-token")
+    state = Core.set_auth(state, Auth.Token.user("jwt-token"))
     {state, _subscriber, _initial} = Core.subscribe(state, "messages:list", %{})
     {state, _request_id} = Core.prepare_action(state, "ai:generate", %{"prompt" => "hello"})
     {state, _drained} = Core.take_outbox(state)
 
     {_state, [auth, modify_query_set, action]} =
-      Core.rebuild_for_reconnect(state, {:token, "jwt-token"})
+      Core.rebuild_for_reconnect(state, {:token, Auth.Token.user("jwt-token")})
 
-    assert auth.token_type == "User"
+    assert auth.token == Auth.Token.user("jwt-token")
     assert modify_query_set.base_version == 0
     assert action.request_id == 0
+  end
+
+  test "connected authentication updates increment identity version once per token type" do
+    state = Core.new()
+    identity = Auth.Identity.new(token_identifier: "convex|user")
+
+    {state, [user]} = Core.take_outbox(Core.set_auth(state, Auth.Token.user("jwt")))
+    {state, [none]} = Core.take_outbox(Core.set_auth(state, Auth.Token.none()))
+    {state, [admin]} = Core.take_outbox(Core.set_auth(state, Auth.Token.admin("key")))
+
+    {_state, [impersonated]} =
+      Core.take_outbox(Core.set_auth(state, Auth.Token.admin("key", identity)))
+
+    assert user.base_version == 0
+    assert none.base_version == 1
+    assert admin.base_version == 2
+    assert impersonated.base_version == 3
   end
 end

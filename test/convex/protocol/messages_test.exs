@@ -1,6 +1,8 @@
 defmodule Convex.Protocol.MessagesTest do
   use ExUnit.Case, async: true
 
+  alias Convex.Auth
+
   alias Convex.Protocol.Messages.{
     Action,
     ActionResponse,
@@ -30,7 +32,7 @@ defmodule Convex.Protocol.MessagesTest do
     {ModifyQuerySet, [:base_version, :new_version, :modifications]},
     {Mutation, [:request_id, :udf_path, :args]},
     {Action, [:request_id, :udf_path, :args]},
-    {Authenticate, [:base_version, :token_type]},
+    {Authenticate, [:base_version, :token]},
     {QueryUpdated, [:query_id, :value, :log_lines]},
     {QueryFailed, [:query_id, :error_message, :log_lines]},
     {QueryRemoved, [:query_id]},
@@ -73,10 +75,10 @@ defmodule Convex.Protocol.MessagesTest do
       assert m.component_path == :absent
     end
 
-    test "Authenticate defaults acting_as to :absent" do
-      a = struct!(Authenticate, %{base_version: 0, token_type: "User"})
-      assert a.acting_as == :absent
-      assert a.value == nil
+    test "Authenticate carries the opaque auth token" do
+      token = Auth.Token.user("jwt")
+      a = struct!(Authenticate, %{base_version: 0, token: token})
+      assert a.token == token
     end
 
     test "QueryFailed defaults error_data and journal to :absent" do

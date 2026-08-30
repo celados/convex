@@ -17,4 +17,6 @@ defmodule Convex do
   defdelegate watch_connection_state(client, opts \\ []), to: Client
   defdelegate unwatch_connection_state(client, watch), to: Client
   defdelegate set_auth(client, token), to: Client
+  defdelegate set_admin_auth(client, deploy_key, identity \\ nil), to: Client
+  defdelegate set_auth_fetcher(client, fetcher), to: Client
 end

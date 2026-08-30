@@ -2,7 +2,7 @@
 type: Proposal
 title: Admin authentication
 description: Design complete User, Admin, and Admin-acting-as-user authentication for the Elixir client.
-status: draft
+status: accepted
 version: 0.3
 generated:
   by: codex/gpt-5

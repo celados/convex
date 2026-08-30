@@ -4,6 +4,7 @@ defmodule Convex.Client do
   use GenServer
   require Logger
 
+  alias Convex.Auth
   alias Convex.Backoff
   alias Convex.Protocol.Codec
   alias Convex.Protocol.Messages.Connect
@@ -56,8 +57,13 @@ defmodule Convex.Client do
     :watchers,
     :connection_watchers,
     :backoff,
-    :auth_fetcher,
-    :auth_token,
+    :auth_source,
+    :active_token,
+    :auth_generation,
+    :connection_generation,
+    :pending_auth,
+    :auth_ready,
+    :pending_messages,
     :connection_state,
     :monotonic_clock,
     :system_clock,
@@ -66,9 +72,12 @@ defmodule Convex.Client do
 
   @type connection_state :: :connecting | :connected
   @type function_result :: Core.function_result()
+  @type auth_fetcher :: (keyword() -> {:ok, Auth.Token.t()} | {:error, term()})
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) when is_list(opts) do
+    auth_source = start_auth_source(opts)
+    opts = Keyword.put(opts, :auth_source, auth_source)
     GenServer.start_link(__MODULE__, opts)
   end
 
@@ -131,13 +140,66 @@ defmodule Convex.Client do
     GenServer.call(client, {:unwatch_connection_state, watch})
   end
 
-  @spec set_auth(pid(), String.t() | nil) :: :ok | {:error, String.t()}
+  @spec set_auth(pid(), String.t() | nil) :: :ok
   def set_auth(client, token) do
+    token =
+      case token do
+        nil -> Auth.Token.none()
+        credential -> Auth.Token.user(credential)
+      end
+
     GenServer.call(client, {:set_auth, token})
   end
 
+  @spec set_admin_auth(pid(), String.t(), Auth.Identity.t() | nil) :: :ok
+  def set_admin_auth(client, deploy_key, identity \\ nil) do
+    GenServer.call(client, {:set_auth, Auth.Token.admin(deploy_key, identity)})
+  end
+
+  @spec set_auth_fetcher(pid(), nil) :: :ok
+  @spec set_auth_fetcher(pid(), auth_fetcher()) :: :ok
+  def set_auth_fetcher(client, nil) do
+    GenServer.call(client, {:set_auth_fetcher, nil})
+  end
+
+  def set_auth_fetcher(client, fetcher) when is_function(fetcher, 1) do
+    GenServer.call(client, {:set_auth_fetcher, fetcher})
+  end
+
+  def set_auth_fetcher(_client, _fetcher),
+    do: raise(ArgumentError, "auth_fetcher must be nil or a one-argument function")
+
   def default_monotonic_clock, do: System.monotonic_time(:millisecond)
   def default_system_clock, do: System.system_time(:millisecond)
+
+  defp start_auth_source(opts) do
+    has_auth? = Keyword.has_key?(opts, :auth)
+    has_fetcher? = Keyword.has_key?(opts, :auth_fetcher)
+
+    cond do
+      Keyword.has_key?(opts, :auth_token) ->
+        raise ArgumentError, "auth_token was removed; use auth: Auth.Token.t()"
+
+      has_auth? and has_fetcher? ->
+        raise ArgumentError, "auth and auth_fetcher are mutually exclusive"
+
+      has_auth? ->
+        token = Keyword.fetch!(opts, :auth)
+        unless Auth.Token.valid?(token), do: raise(ArgumentError, "Invalid auth token")
+        {:static, token}
+
+      has_fetcher? ->
+        fetcher = Keyword.fetch!(opts, :auth_fetcher)
+
+        unless is_function(fetcher, 1),
+          do: raise(ArgumentError, "auth_fetcher must be a one-argument function")
+
+        {:fetcher, fetcher}
+
+      true ->
+        {:static, Auth.Token.none()}
+    end
+  end
 
   @impl true
   def init(opts) do
@@ -148,7 +210,7 @@ defmodule Convex.Client do
     transport_opts = Keyword.get(opts, :transport_opts, [])
     inactivity_check_ms = Keyword.get(opts, :inactivity_check_ms, 5_000)
     inactivity_timeout_ms = Keyword.get(opts, :inactivity_timeout_ms, 30_000)
-    auth_fetcher = Keyword.get(opts, :auth_fetcher)
+    auth_source = Keyword.fetch!(opts, :auth_source)
     monotonic_clock = Keyword.get(opts, :monotonic_clock, &__MODULE__.default_monotonic_clock/0)
     system_clock = Keyword.get(opts, :system_clock, &__MODULE__.default_system_clock/0)
 
@@ -172,8 +234,13 @@ defmodule Convex.Client do
       watchers: %{},
       connection_watchers: %{},
       backoff: Backoff.new(Keyword.get(opts, :backoff, [])),
-      auth_fetcher: auth_fetcher,
-      auth_token: Keyword.get(opts, :auth_token),
+      auth_source: auth_source,
+      active_token: Auth.Token.none(),
+      auth_generation: 0,
+      connection_generation: 0,
+      pending_auth: nil,
+      auth_ready: false,
+      pending_messages: :queue.new(),
       connection_state: :connecting,
       monotonic_clock: monotonic_clock,
       system_clock: system_clock,
@@ -264,19 +331,34 @@ defmodule Convex.Client do
   end
 
   def handle_call({:set_auth, token}, _from, state) do
-    with :ok <- validate_auth_token(token) do
-      core = state.core |> Core.set_auth(token)
-      {core, messages} = Core.take_outbox(core)
-      state = %{state | core: core, auth_token: token}
-
-      case dispatch_messages(state, messages) do
-        {:ok, state} -> {:reply, :ok, state}
-        {:error, reason} -> {:reply, {:error, reason}, state}
-      end
+    if Auth.Token.valid?(token) do
+      pending_mode = pending_auth_mode(state)
+      state = replace_auth_source(state, {:static, token})
+      {:reply, :ok, set_static_auth(state, token, pending_mode)}
     else
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      raise ArgumentError, "Invalid auth token"
     end
+  end
+
+  def handle_call({:set_auth_fetcher, nil}, _from, state) do
+    token = Auth.Token.none()
+    pending_mode = pending_auth_mode(state)
+    state = replace_auth_source(state, {:static, token})
+    {:reply, :ok, set_static_auth(state, token, pending_mode)}
+  end
+
+  def handle_call({:set_auth_fetcher, fetcher}, _from, state) do
+    pending_mode = pending_auth_mode(state)
+    state = replace_auth_source(state, {:fetcher, fetcher})
+
+    next_state =
+      if pending_mode == :connection do
+        start_auth_resolution(state)
+      else
+        start_runtime_auth_fetch(state, pending_mode == :runtime)
+      end
+
+    {:reply, :ok, next_state}
   end
 
   def handle_call({:mutation, udf_path, args}, from, state) do
@@ -365,32 +447,18 @@ defmodule Convex.Client do
 
     state = %{
       state
-      | last_server_response_ms: state.monotonic_clock.()
+      | last_server_response_ms: state.monotonic_clock.(),
+        connection_count: state.connection_count + 1,
+        connection_generation: state.connection_generation + 1,
+        auth_ready: false,
+        pending_auth: nil,
+        pending_messages: :queue.new(),
+        connection_state: :connecting
     }
 
-    case dispatch_messages(state, [connect_message]) do
+    case dispatch_control_messages(state, [connect_message]) do
       {:ok, state} ->
-        {state, auth_input} = resolve_auth_input(state)
-
-        {core, messages} =
-          if state.connection_count == 0 do
-            state.core
-            |> apply_initial_auth(auth_input)
-            |> Core.take_outbox()
-          else
-            Core.rebuild_for_reconnect(state.core, auth_input)
-          end
-
-        state = %{
-          state
-          | core: core,
-            connection_count: state.connection_count + 1
-        }
-
-        case dispatch_messages(state, messages) do
-          {:ok, state} -> {:noreply, transition_connection_state(state, :connected)}
-          {:error, reason} -> {:noreply, reconnect(state, "EncodeError: #{reason}")}
-        end
+        {:noreply, start_auth_resolution(state)}
 
       {:error, reason} ->
         {:noreply, reconnect(state, "EncodeError: #{reason}")}
@@ -437,6 +505,17 @@ defmodule Convex.Client do
        %{state | transport_pid: nil},
        inspect(reason)
      )}
+  end
+
+  def handle_info({:auth_fetch_complete, generation, result}, state) do
+    if state.pending_auth && state.pending_auth.generation == generation do
+      case state.pending_auth.mode do
+        :connection -> {:noreply, complete_connection_auth(state, result)}
+        :runtime -> {:noreply, complete_runtime_auth(state, result)}
+      end
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info({:EXIT, transport_pid, reason}, %{transport_pid: transport_pid} = state) do
@@ -501,14 +580,33 @@ defmodule Convex.Client do
   end
 
   defp dispatch_messages(state, messages) do
-    with {:ok, payloads} <- encode_messages(messages) do
-      Enum.each(payloads, fn payload ->
-        if state.transport_pid do
-          _result = state.transport_module.send_text(state.transport_pid, payload)
-        end
-      end)
+    if state.auth_ready do
+      with {:ok, payloads} <- encode_messages(messages) do
+        Enum.each(payloads, &send_payload(state, &1))
 
-      {:ok, state}
+        {:ok, state}
+      end
+    else
+      # Authentication owns message ordering: no function request may race an Authenticate.
+      {:ok, queue_pending_messages(state, messages)}
+    end
+  end
+
+  defp dispatch_control_messages(state, messages) do
+    if state.transport_pid do
+      with {:ok, payloads} <- encode_messages(messages) do
+        Enum.each(payloads, &send_payload(state, &1))
+
+        {:ok, state}
+      end
+    else
+      {:error, "TransportNotConnected"}
+    end
+  end
+
+  defp send_payload(state, payload) do
+    if state.transport_pid do
+      _result = state.transport_module.send_text(state.transport_pid, payload)
     end
   end
 
@@ -592,10 +690,22 @@ defmodule Convex.Client do
       _result = state.transport_module.close(state.transport_pid)
     end
 
-    schedule_reconnect(%{state | transport_pid: nil}, reason)
+    schedule_reconnect(
+      %{
+        state
+        | transport_pid: nil,
+          auth_ready: false,
+          pending_auth: nil,
+          active_token: Auth.Token.none(),
+          pending_messages: :queue.new()
+      },
+      reason
+    )
   end
 
   defp schedule_reconnect(state, reason) do
+    state = cancel_pending_auth_task(state)
+
     if state.pending_reconnect_timer do
       Process.cancel_timer(state.pending_reconnect_timer)
     end
@@ -631,41 +741,228 @@ defmodule Convex.Client do
 
   defp validate_args(_args), do: {:error, "Arguments must be a map"}
 
-  defp validate_auth_token(token) when is_binary(token) or is_nil(token), do: :ok
-  defp validate_auth_token(_token), do: {:error, "Auth token must be a string or nil"}
+  defp replace_auth_source(state, source) do
+    state = cancel_pending_auth_task(state)
 
-  defp resolve_auth_input(state) do
-    force_refresh = state.connection_count > 0
+    %{state | auth_source: source, auth_generation: state.auth_generation + 1, pending_auth: nil}
+  end
 
-    case state.auth_fetcher do
-      nil ->
-        {state, auth_input_from_token(state.auth_token)}
+  defp set_static_auth(state, _token, :connection), do: start_auth_resolution(state)
 
-      fetcher ->
-        case normalize_fetched_token(fetcher.(force_refresh: force_refresh)) do
-          {:ok, token} ->
-            {%{state | auth_token: token}, auth_input_from_token(token)}
+  defp set_static_auth(state, token, :runtime),
+    do: complete_runtime_auth(state, {:ok, token})
 
-          :no_auth ->
-            # fetcher returning nil semantically means "this connection should be anonymous";
-            # we must not reuse the old token, otherwise logout/refresh failure will cause
-            # us to silently reconnect with expired credentials.
-            {%{state | auth_token: nil}, :no_auth}
-        end
+  defp set_static_auth(state, token, nil), do: apply_static_auth(state, token)
+
+  defp apply_static_auth(state, token) do
+    if state.connection_state == :connected do
+      {core, messages} = state.core |> Core.set_auth(token) |> Core.take_outbox()
+      state = %{state | core: core, active_token: token}
+
+      case dispatch_control_messages(state, messages) do
+        {:ok, state} -> state
+        {:error, reason} -> reconnect(state, "EncodeError: #{reason}")
+      end
+    else
+      %{state | active_token: Auth.Token.none()}
     end
   end
 
-  defp normalize_fetched_token({:ok, token}) when is_binary(token) or is_nil(token),
-    do: {:ok, token}
+  defp start_runtime_auth_fetch(state, preserve_pending) do
+    # Revoke before the asynchronous fetch so a failure cannot continue under the prior credential.
+    was_authenticated = state.connection_state == :connected and state.active_token.type != :none
 
-  defp normalize_fetched_token(token) when is_binary(token) or is_nil(token), do: {:ok, token}
-  defp normalize_fetched_token(_token), do: :no_auth
+    state = %{
+      state
+      | auth_ready: false,
+        pending_messages: if(preserve_pending, do: state.pending_messages, else: :queue.new()),
+        active_token: Auth.Token.none()
+    }
 
-  defp auth_input_from_token(nil), do: :no_auth
-  defp auth_input_from_token(token), do: {:token, token}
+    state = transition_connection_state(state, :connecting)
 
-  defp apply_initial_auth(core, :no_auth), do: core
-  defp apply_initial_auth(core, {:token, token}), do: Core.set_auth(core, token)
+    revocation =
+      if was_authenticated do
+        {core, messages} = state.core |> Core.set_auth(Auth.Token.none()) |> Core.take_outbox()
+        {%{state | core: core}, messages}
+      else
+        {state, []}
+      end
+
+    case dispatch_control_messages(elem(revocation, 0), elem(revocation, 1)) do
+      {:ok, state} -> start_auth_fetch(state, false, :runtime)
+      {:error, reason} -> reconnect(state, "EncodeError: #{reason}")
+    end
+  end
+
+  defp pending_auth_mode(state) do
+    if state.pending_auth, do: state.pending_auth.mode
+  end
+
+  defp cancel_pending_auth_task(state) do
+    if state.pending_auth && state.pending_auth.task_pid do
+      Process.exit(state.pending_auth.task_pid, :kill)
+    end
+
+    state
+  end
+
+  defp start_auth_resolution(state) do
+    case state.auth_source do
+      {:static, token} -> complete_connection_auth(state, {:ok, token})
+      {:fetcher, _fetcher} -> start_auth_fetch(state, state.connection_count > 1, :connection)
+    end
+  end
+
+  defp start_auth_fetch(state, force_refresh, mode) do
+    {:fetcher, fetcher} = state.auth_source
+    generation = {state.connection_generation, state.auth_generation}
+    parent = self()
+
+    task_result =
+      Task.Supervisor.start_child(Convex.AuthTaskSupervisor, fn ->
+        # Normalize crashes inside the wrapper so OTP never renders callback reasons or secrets.
+        result =
+          try do
+            fetcher.(force_refresh: force_refresh)
+          rescue
+            _error -> {:error, :auth_fetch_failed}
+          catch
+            :exit, _reason -> {:error, :auth_fetch_failed}
+            :throw, _value -> {:error, :auth_fetch_failed}
+          end
+          |> normalize_fetched_token()
+
+        send(parent, {:auth_fetch_complete, generation, result})
+      end)
+
+    case task_result do
+      {:ok, task_pid} ->
+        %{state | pending_auth: %{generation: generation, mode: mode, task_pid: task_pid}}
+
+      {:error, _reason} ->
+        complete_auth_fetch_failure(state, mode)
+    end
+  end
+
+  defp complete_connection_auth(state, result) do
+    state =
+      if state.connection_count > 1,
+        do: %{state | pending_messages: :queue.new()},
+        else: state
+
+    token = anonymous_token_to_no_auth(error_to_anonymous(result))
+
+    if auth_fetch_failed?(result),
+      do: Logger.warning("Convex auth fetch failed; continuing anonymously")
+
+    {core, messages} = connection_auth_messages(state, token)
+
+    state = %{
+      state
+      | core: core,
+        active_token: token || Auth.Token.none(),
+        auth_ready: true,
+        pending_auth: nil
+    }
+
+    finish_auth_messages(state, messages)
+  end
+
+  defp complete_runtime_auth(state, result) do
+    token = anonymous_token_to_no_auth(error_to_anonymous(result))
+
+    if auth_fetch_failed?(result),
+      do: Logger.warning("Convex auth fetch failed; continuing anonymously")
+
+    {core, messages} =
+      case token do
+        nil -> {state.core, []}
+        token -> state.core |> Core.set_auth(token) |> Core.take_outbox()
+      end
+
+    state = %{
+      state
+      | core: core,
+        active_token: token || Auth.Token.none(),
+        auth_ready: true,
+        pending_auth: nil
+    }
+
+    finish_auth_messages(state, messages)
+  end
+
+  defp connection_auth_messages(state, nil) do
+    if state.connection_count == 1 do
+      {state.core, []}
+    else
+      Core.rebuild_for_reconnect(state.core, :no_auth)
+    end
+  end
+
+  defp connection_auth_messages(state, token) do
+    if state.connection_count == 1 do
+      state.core |> Core.set_auth(token) |> Core.take_outbox()
+    else
+      Core.rebuild_for_reconnect(state.core, {:token, token})
+    end
+  end
+
+  defp finish_auth_messages(state, messages) do
+    {auth_messages, business_messages} =
+      Enum.split_with(messages, &match?(%Convex.Protocol.Messages.Authenticate{}, &1))
+
+    pending_messages = :queue.to_list(state.pending_messages)
+    state = %{state | pending_messages: :queue.new()}
+
+    case dispatch_control_messages(state, auth_messages) do
+      {:ok, state} ->
+        case dispatch_messages(state, business_messages ++ pending_messages) do
+          {:ok, state} -> transition_connection_state(state, :connected)
+          {:error, reason} -> reconnect(state, "EncodeError: #{reason}")
+        end
+
+      {:error, reason} ->
+        reconnect(state, "EncodeError: #{reason}")
+    end
+  end
+
+  defp fetched_token({:ok, %Auth.Token{} = token}) do
+    if Auth.Token.valid?(token), do: token
+  end
+
+  defp fetched_token(_result), do: :error
+
+  defp error_to_anonymous(result) do
+    case fetched_token(result) do
+      :error -> nil
+      token -> token
+    end
+  end
+
+  defp anonymous_token_to_no_auth(%Auth.Token{type: :none}), do: nil
+  defp anonymous_token_to_no_auth(token), do: token
+
+  defp auth_fetch_failed?({:ok, %Auth.Token{} = token}), do: not Auth.Token.valid?(token)
+  defp auth_fetch_failed?(_result), do: true
+
+  defp complete_auth_fetch_failure(state, :connection),
+    do: complete_connection_auth(state, {:error, :start_failed})
+
+  defp complete_auth_fetch_failure(state, :runtime),
+    do: complete_runtime_auth(state, {:error, :start_failed})
+
+  defp normalize_fetched_token({:ok, %Auth.Token{} = token}) do
+    if Auth.Token.valid?(token), do: {:ok, token}, else: {:error, :invalid_auth_token}
+  end
+
+  defp normalize_fetched_token({:error, _reason}), do: {:error, :auth_fetch_failed}
+  defp normalize_fetched_token(_result), do: {:error, :invalid_auth_token}
+
+  defp queue_pending_messages(state, messages) do
+    queue = Enum.reduce(messages, state.pending_messages, &:queue.in/2)
+    %{state | pending_messages: queue}
+  end
 
   defp transition_connection_state(state, new_state) do
     if state.connection_state == new_state do

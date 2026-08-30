@@ -114,14 +114,67 @@ Convex.set_auth(client, "your-jwt-token")
 # Clear auth
 Convex.set_auth(client, nil)
 
-# Token fetcher (called on connect and reconnect)
+# Or provide a static token when starting
+{:ok, client} = Convex.start_link(
+  deployment_url: "https://your-app.convex.cloud",
+  auth: Convex.Auth.Token.user("your-jwt-token")
+)
+
+# Token fetcher (called initially and on every reconnect)
 {:ok, client} = Convex.start_link(
   deployment_url: "https://your-app.convex.cloud",
   auth_fetcher: fn force_refresh: force_refresh ->
-    # Return a fresh token string, or nil to clear auth
+    # Return {:ok, Convex.Auth.Token.t()} or {:error, reason}
     fetch_token(force_refresh)
   end
 )
+```
+
+The fetcher runs outside the client process. While authentication is being
+resolved, the transport may be open but queries, mutations, actions, and
+subscription changes remain queued. They are sent only after authentication has
+been resolved, so they never race an `Authenticate` message.
+
+On reconnect, a successful fetch is sent before replaying outstanding requests.
+If fetching fails, that connection continues anonymously and the fetcher is
+tried again on the next reconnect. Replacing an authenticated static token with
+a fetcher first sends an explicit anonymous authentication message, so a fetch
+failure cannot leave requests running under the old credential.
+
+## Admin Authentication
+
+Admin authentication uses a deployment deploy key. Treat it as a highly
+privileged credential: the client redacts it in Inspect output, but it must
+necessarily be present in protocol traffic sent to your Convex deployment.
+
+```elixir
+identity =
+  Convex.Auth.Identity.new(
+    issuer: "https://your-auth-provider.example.com",
+    subject: "user-123",
+    custom_claims: %{"isAdmin" => true}
+  )
+
+Convex.set_admin_auth(client, deploy_key)
+Convex.set_admin_auth(client, deploy_key, identity)
+```
+
+`Identity.new/1` accepts atom-keyed keyword lists or maps. When
+`token_identifier` is not supplied, `issuer` and `subject` are required and are
+normalized to the upstream `issuer <> "|" <> subject` identifier. Custom claims
+are JSON values and are flattened into the top level of the wire identity, just
+like the official Rust client.
+
+The fetcher API can also return an admin token:
+
+```elixir
+auth_fetcher: fn force_refresh: force_refresh ->
+  if force_refresh do
+    {:ok, Convex.Auth.Token.admin(deploy_key, identity)}
+  else
+    {:ok, Convex.Auth.Token.user(jwt)}
+  end
+end
 ```
 
 ## Value Types
@@ -147,8 +200,7 @@ Convex.start_link(
   deployment_url: "https://your-app.convex.cloud",
 
   # Auth (optional)
-  auth_token: "static-jwt",                    # or use auth_fetcher
-  auth_fetcher: fn force_refresh: _ -> "jwt" end,
+  auth: Convex.Auth.Token.user("static-jwt"),
 
   # Timeouts
   inactivity_check_ms: 5_000,                  # how often to check server liveness

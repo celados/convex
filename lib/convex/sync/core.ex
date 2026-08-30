@@ -1,6 +1,7 @@
 defmodule Convex.Sync.Core do
   @moduledoc false
 
+  alias Convex.Auth.Token
   alias Convex.ConvexError
 
   alias Convex.Protocol.Messages.{
@@ -169,15 +170,10 @@ defmodule Convex.Sync.Core do
     end
   end
 
-  @spec set_auth(t(), String.t() | nil) :: t()
-  def set_auth(%__MODULE__{} = state, token) when is_binary(token) or is_nil(token) do
+  @spec set_auth(t(), Token.t()) :: t()
+  def set_auth(%__MODULE__{} = state, %Token{} = token) do
     base_version = state.identity_version
-
-    message =
-      case token do
-        nil -> %Authenticate{base_version: base_version, token_type: "None"}
-        value -> %Authenticate{base_version: base_version, token_type: "User", value: value}
-      end
+    message = %Authenticate{base_version: base_version, token: token}
 
     state
     |> Map.put(:identity_version, base_version + 1)
@@ -236,11 +232,12 @@ defmodule Convex.Sync.Core do
     {%{state | outbox: queue}, messages}
   end
 
-  @spec rebuild_for_reconnect(t(), :no_auth | {:token, String.t()}) :: {t(), [struct()]}
+  @spec rebuild_for_reconnect(t(), :no_auth | {:token, Token.t()}) :: {t(), [struct()]}
   def rebuild_for_reconnect(%__MODULE__{} = state, auth_input) do
     auth_messages =
       case auth_input do
-        {:token, token} -> [%Authenticate{base_version: 0, token_type: "User", value: token}]
+        {:token, %Token{type: :none}} -> []
+        {:token, %Token{} = token} -> [%Authenticate{base_version: 0, token: token}]
         :no_auth -> []
       end
 
@@ -264,7 +261,7 @@ defmodule Convex.Sync.Core do
     reset_state =
       %{
         state
-        | identity_version: if(auth_input == :no_auth, do: 0, else: 1),
+        | identity_version: if(auth_messages == [], do: 0, else: 1),
           query_set_version: if(modifications == [], do: 0, else: 1),
           remote_version: %StateVersion{query_set: 0, identity: 0, ts: 0},
           remote_query_set: %{},

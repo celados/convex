@@ -48,3 +48,8 @@ No spec-compliance issues found. Three minor improvements identified and applied
 
 - Audited the Elixir implementation against `get-convex/convex-rs@e4eb7e2` at its March baseline and `a0fd168` at upstream `main`.
 - The only client-semantic change was clearing a query's cached result when its last subscriber drops. Elixir already did this; the Core regression test now locks the behavior.
+
+### [x] Complete admin authentication — completed 2026-08-30
+
+- Implemented User, Admin, Admin-acting-as-user, static auth, dynamic fetchers, reconnect replay, and credential redaction as specified in `docs/admin-auth.md`.
+- Runtime fetcher replacement deliberately revokes the previous credential before asynchronous fetching. This is an Elixir-side safety improvement over the current upstream runtime replacement path.
