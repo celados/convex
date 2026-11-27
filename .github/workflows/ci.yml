@@ -53,6 +53,12 @@ jobs:
           key: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
+      - name: DEBUG proxy (temporary)
+        run: |
+          env | grep -i proxy || echo "no proxy env"
+          mix hex.config
+          mix run --no-start --no-deps-check -e 'IO.inspect({System.get_env("https_proxy"), System.get_env("HTTPS_PROXY")})' 2>&1 || true
+          mix hex.info castore 2>&1 | head -3 || true
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
