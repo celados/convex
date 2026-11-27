@@ -14,16 +14,23 @@ concurrency:
 
 env:
   MIX_ENV: test
+  # setup-beam picks its OTP build from ImageOS, which only GitHub-hosted
+  # images set; the celados-linux runner image and the fork-PR fallback
+  # are both Ubuntu 24.04.
+  ImageOS: ubuntu24
   ELIXIR_VERSION: "1.17"
   OTP_VERSION: "27"
 
 permissions:
   contents: read
 
+# Fork PRs run untrusted code: they stay on GitHub-hosted runners. Every
+# other run uses the celados-linux self-hosted pool.
 jobs:
   quality:
     name: Quality checks
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'celados-linux' }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -32,29 +39,57 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps
-        uses: actions/cache@v4
+      # Restore and save are separate steps on the self-hosted pool: an upload
+      # through its proxy can stall indefinitely, and a post-job save step
+      # cannot take a timeout. A failed save only costs the next run a cold cache.
+      - name: Restore deps
+        id: cache-deps
+        uses: actions/cache/restore@v4
         with:
           path: deps
           key: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - name: Cache build
-        uses: actions/cache@v4
+      - name: Restore build
+        id: cache-build
+        uses: actions/cache/restore@v4
         with:
           path: _build
           key: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+
+      # Hex's TLS connections through the self-hosted pool's proxy are
+      # occasionally reset (`:closed`); retry the fetch before giving up.
+      - name: mix deps.get
+        run: for i in 1 2 3; do mix deps.get && exit 0; sleep $((i * 10)); done; exit 1
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix credo --strict
       - run: mix ex_dna
 
+      - name: Save deps
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+
+      - name: Save build
+        if: steps.cache-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: _build
+          key: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+
   dialyzer:
     name: Dialyzer
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'celados-linux' }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -63,27 +98,54 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps
-        uses: actions/cache@v4
+      # Restore and save are separate steps on the self-hosted pool: an upload
+      # through its proxy can stall indefinitely, and a post-job save step
+      # cannot take a timeout. A failed save only costs the next run a cold cache.
+      - name: Restore deps
+        id: cache-deps
+        uses: actions/cache/restore@v4
         with:
           path: deps
           key: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - name: Cache PLTs
-        uses: actions/cache@v4
+      - name: Restore PLTs
+        id: cache-plts
+        uses: actions/cache/restore@v4
         with:
           path: priv/plts
           key: plts-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: plts-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+      # Hex's TLS connections through the self-hosted pool's proxy are
+      # occasionally reset (`:closed`); retry the fetch before giving up.
+      - name: mix deps.get
+        run: for i in 1 2 3; do mix deps.get && exit 0; sleep $((i * 10)); done; exit 1
       - run: mkdir -p priv/plts
       - run: mix dialyzer
 
+      - name: Save deps
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+
+      - name: Save PLTs
+        if: steps.cache-plts.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: priv/plts
+          key: plts-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'celados-linux' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -92,19 +154,45 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps
-        uses: actions/cache@v4
+      # Restore and save are separate steps on the self-hosted pool: an upload
+      # through its proxy can stall indefinitely, and a post-job save step
+      # cannot take a timeout. A failed save only costs the next run a cold cache.
+      - name: Restore deps
+        id: cache-deps
+        uses: actions/cache/restore@v4
         with:
           path: deps
           key: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - name: Cache build
-        uses: actions/cache@v4
+      - name: Restore build
+        id: cache-build
+        uses: actions/cache/restore@v4
         with:
           path: _build
           key: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+      # Hex's TLS connections through the self-hosted pool's proxy are
+      # occasionally reset (`:closed`); retry the fetch before giving up.
+      - name: mix deps.get
+        run: for i in 1 2 3; do mix deps.get && exit 0; sleep $((i * 10)); done; exit 1
       - run: mix test --exclude integration
+
+      - name: Save deps
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+
+      - name: Save build
+        if: steps.cache-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: _build
+          key: build-${{ runner.os }}-${{ env.MIX_ENV }}-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
