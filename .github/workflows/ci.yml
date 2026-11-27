@@ -14,16 +14,23 @@ concurrency:
 
 env:
   MIX_ENV: test
+  # setup-beam picks its OTP build from ImageOS, which only GitHub-hosted
+  # images set; the celados-linux runner image and the fork-PR fallback
+  # are both Ubuntu 24.04.
+  ImageOS: ubuntu24
   ELIXIR_VERSION: "1.17"
   OTP_VERSION: "27"
 
 permissions:
   contents: read
 
+# Fork PRs run untrusted code: they stay on GitHub-hosted runners. Every
+# other run uses the celados-linux self-hosted pool.
 jobs:
   quality:
     name: Quality checks
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'celados-linux' }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +61,8 @@ jobs:
 
   dialyzer:
     name: Dialyzer
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'celados-linux' }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +91,8 @@ jobs:
 
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'celados-linux' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
